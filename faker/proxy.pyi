@@ -369,6 +369,15 @@ class Faker:
         """
         ...
 
+    def numeric_code(self, prefix: str = ..., digits: int = ...) -> str:
+        """
+        Generate a fixed length numeric code sharing a constant ``prefix``.
+
+        :sample: prefix="SKU-", digits=4
+        :sample: prefix="", digits=6
+        """
+        ...
+
     def random_letter(self) -> str:
         """
         Generate a random ASCII letter (a-z and A-Z).

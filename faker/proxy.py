@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import functools
 import re
+import random as random_module
 
 from collections import OrderedDict
 from random import Random
@@ -12,6 +13,7 @@ from .config import DEFAULT_LOCALE
 from .exceptions import UniquenessException
 from .factory import Factory
 from .generator import Generator
+from .providers.domains import FINITE_DOMAIN_ATTR, ValueDomain
 from .typing import SeedType
 from .utils.distribution import choices_distribution
 
@@ -304,9 +306,13 @@ class UniqueProxy:
         self._seen: dict = {}
         self._sentinel = object()
         self._excluded_types = excluded_types
+        # State for provider methods that declare a finite value domain, keyed
+        # by the same (name, args, kwargs) signature used for ``self._seen``.
+        self._domains: dict = {}
 
     def clear(self) -> None:
         self._seen = {}
+        self._domains = {}
 
     def exclude_types(self, types: list[type]) -> UniqueProxy:
         """Return new UniqueProxy excluding specified types from uniqueness checks.
@@ -334,6 +340,7 @@ class UniqueProxy:
         unique_proxy = UniqueProxy(locale_proxy, self._excluded_types)
         unique_proxy._seen = self._seen
         unique_proxy._sentinel = self._sentinel
+        unique_proxy._domains = self._domains
         return unique_proxy
 
     def __getattr__(self, name: str) -> Any:
@@ -364,8 +371,19 @@ class UniqueProxy:
         return value
 
     def _wrap(self, name: str, function: Callable) -> Callable:
+        domain_cls = getattr(function, FINITE_DOMAIN_ATTR, None)
+
         @functools.wraps(function)
         def wrapper(*args, **kwargs):
+            key = (name, args, tuple(sorted(kwargs.items())))
+
+            # Provider methods that declare a finite domain take a dedicated
+            # sampling path: a sparse partial shuffle over the domain indices
+            # gives uniform sampling without replacement without any retries,
+            # even on tiny value ranges.
+            if domain_cls is not None:
+                return self._sample_unique_domain(domain_cls, function, key, args, kwargs)
+
             # If types are excluded, call function once to check return type
             if self._excluded_types:
                 retval = function(*args, **kwargs)
@@ -375,7 +393,6 @@ class UniqueProxy:
                 # If not excluded, continue with normal uniqueness logic
                 # but we already have a value, so we'll use it if unique
                 hashable_retval = self._make_hashable(retval)
-                key = (name, args, tuple(sorted(kwargs.items())))
                 generated = self._seen.setdefault(key, {self._sentinel})
 
                 # Check if this first value is unique
@@ -385,7 +402,6 @@ class UniqueProxy:
                 # Not unique, continue with normal loop below
             else:
                 # No exclusions, use original logic
-                key = (name, args, tuple(sorted(kwargs.items())))
                 generated = self._seen.setdefault(key, {self._sentinel})
                 retval = self._sentinel
                 hashable_retval = self._make_hashable(retval)
@@ -404,6 +420,83 @@ class UniqueProxy:
             return retval
 
         return wrapper
+
+    def _sample_unique_domain(
+        self,
+        domain_cls: type[ValueDomain],
+        function: Callable,
+        key: tuple,
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        state = self._domains.get(key)
+        if state is None:
+            domain = domain_cls(*args, **kwargs)
+            state = _FiniteDomainState(domain, self._random_for(function))
+            self._domains[key] = state
+
+        if state.remaining <= 0:
+            msg = (
+                f"Got duplicated values after exhausting the finite domain "
+                f"of {state.domain.size:,} unique value(s)."
+            )
+            raise UniquenessException(msg)
+
+        index = state.draw_index()
+        generated = self._seen.setdefault(key, {self._sentinel})
+        retval = state.domain.unrank(index)
+        generated.add(self._make_hashable(retval))
+        return retval
+
+    def _random_for(self, function: Callable) -> Random:
+        """Best-effort access to the same RNG the provider method would use."""
+        bound_self = getattr(function, "__self__", None)
+        generator = getattr(bound_self, "generator", None)
+        random = getattr(generator, "random", None)
+        if isinstance(random, Random):
+            return random
+        factories = getattr(self._proxy, "factories", None)
+        if factories:
+            return factories[0].random
+        return random_module.Random()
+
+
+class _FiniteDomainState:
+    """Permutation based sampler for a single finite domain signature.
+
+    Indices are consumed through a sparse partial Fisher-Yates shuffle.  Only
+    indices whose position has ever been swapped are stored, so memory grows
+    with the number of values drawn (plus one entry per draw) rather than with
+    the size of the domain.
+    """
+
+    __slots__ = ("domain", "_random", "_remaining", "_swaps")
+
+    def __init__(self, domain: ValueDomain, random: Random) -> None:
+        self.domain = domain
+        self._random = random
+        self._remaining = domain.size
+        # Maps a position in the virtual shuffled suffix to the index it
+        # currently holds.  Missing positions are the identity mapping.
+        self._swaps: dict[int, int] = {}
+
+    @property
+    def remaining(self) -> int:
+        return self._remaining
+
+    def draw_index(self) -> int:
+        if self._remaining <= 0:
+            raise IndexError("finite domain is exhausted")
+        remaining = self._remaining
+        position = self._random.randrange(remaining)
+        last = remaining - 1
+        chosen = self._swaps.get(position, position)
+        self._swaps[position] = self._swaps.get(last, last)
+        # The last slot will never be touched again; drop it to keep the
+        # stored state proportional to the number of values drawn.
+        self._swaps.pop(last, None)
+        self._remaining = remaining - 1
+        return chosen
 
 
 class OptionalProxy:

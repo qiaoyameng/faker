@@ -353,6 +353,64 @@ be raised.
    for i in range(3):
         fake.unique.boolean()  # UniquenessException!
 
+Providers that can declare a finite set of possible outputs use a different
+sampling path.  Instead of generating a value and retrying on collisions, they
+describe their value set through its size and a pair of ``rank``/``unrank``
+functions.  The ``.unique`` proxy then samples indices uniformly *without
+replacement*, so every value is returned exactly once and
+``UniquenessException`` is raised only after the very last value has been
+drawn.  Memory grows with the number of values drawn rather than with the size
+of the domain, which makes domains with billions of candidates safe as long as
+only a few are requested.
+
+``random_int`` (an integer interval) and ``numeric_code`` (a fixed prefix
+followed by a fixed number of digits) declare finite domains out of the box:
+
+.. code:: python
+
+   from faker import Faker
+
+   fake = Faker()
+
+   # Exactly the five values 1..5, in random order, never a collision.
+   numbers = [fake.unique.random_int(min=1, max=5) for _ in range(5)]
+   assert sorted(numbers) == [1, 2, 3, 4, 5]
+
+   fake.unique.random_int(min=1, max=5)  # UniquenessException: domain exhausted
+
+   codes = [fake.unique.numeric_code(prefix="SKU-", digits=2) for _ in range(100)]
+
+Each argument combination keeps its own exhaustion state, and
+``fake.unique.clear()`` resets it.  Custom providers can opt in by decorating a
+method with ``@finite_domain`` and supplying a ``ValueDomain`` subclass:
+
+.. code:: python
+
+   from faker.providers import BaseProvider, ValueDomain, finite_domain
+
+   class EvenDomain(ValueDomain):
+       def __init__(self, count):
+           self._size = count
+
+       @property
+       def size(self):
+           return self._size
+
+       def unrank(self, index):
+           return index * 2
+
+       def rank(self, value):
+           return value // 2
+
+   class CustomProvider(BaseProvider):
+       @finite_domain(EvenDomain)
+       def evens(self, count=5):
+           domain = EvenDomain(count)
+           return domain.unrank(self.generator.random.randrange(domain.size))
+
+Providers that do not declare a finite domain (infinite or unknown value
+ranges) keep the original retry based behavior.
+
 
 For types with limited value sets (like booleans with only 2 values), you can use
 ``exclude_types()`` to prevent uniqueness checks for specific types:

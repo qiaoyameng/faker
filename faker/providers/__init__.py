@@ -7,6 +7,13 @@ from typing import Any, Collection, List, Optional, Sequence, TypeVar, Union
 from ..generator import Generator
 from ..typing import OrderedDictType
 from ..utils.distribution import choices_distribution, choices_distribution_unique
+from .domains import (
+    FINITE_DOMAIN_ATTR,
+    IntegerRangeDomain,
+    NumericCodeDomain,
+    ValueDomain,
+    finite_domain,
+)
 
 _re_hash = re.compile(r"#")
 _re_perc = re.compile(r"%")
@@ -307,6 +314,7 @@ class BaseProvider:
 
         return self.random_element(BaseProvider.language_locale_codes.keys())
 
+    @finite_domain(IntegerRangeDomain)
     def random_int(self, min: int = 0, max: int = 9999, step: int = 1) -> int:
         """Generate a random integer between two integers ``min`` and ``max`` inclusive
         while observing the provided ``step`` value.
@@ -314,10 +322,33 @@ class BaseProvider:
         This method is functionally equivalent to randomly sampling an integer
         from the sequence ``range(min, max + 1, step)``.
 
+        It declares a finite value domain, so sampling through
+        :attr:`Faker.unique <faker.Faker.unique>` never retries and reports
+        exhaustion only after every value of the range has been drawn.
+
         :sample: min=0, max=15
         :sample: min=0, max=15, step=3
         """
         return self.generator.random.randrange(min, max + 1, step)
+
+    @finite_domain(NumericCodeDomain)
+    def numeric_code(self, prefix: str = "", digits: int = 4) -> str:
+        """Generate a fixed length numeric code sharing a constant ``prefix``.
+
+        The numeric portion is exactly ``digits`` decimal digits long and zero
+        padded when needed (for example ``"SKU-0042"``).  Leading zeroes are
+        preserved because the result is a string.
+
+        This method declares a finite value domain of ``10 ** digits`` values,
+        so sampling through :attr:`Faker.unique <faker.Faker.unique>` performs
+        uniform sampling without replacement: it never retries and reports
+        exhaustion only after every possible code has been drawn.
+
+        :sample: prefix="SKU-", digits=4
+        :sample: prefix="", digits=6
+        """
+        domain = NumericCodeDomain(prefix=prefix, digits=digits)
+        return domain.unrank(self.generator.random.randrange(domain.size))
 
     def random_digit(self) -> int:
         """Generate a random digit (0 to 9)."""
