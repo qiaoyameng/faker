@@ -14,6 +14,7 @@ from .factory import Factory
 from .generator import Generator
 from .typing import SeedType
 from .utils.distribution import choices_distribution
+from .utils.unique import DomainSampler, FiniteDomain
 
 _UNIQUE_ATTEMPTS = 1000
 
@@ -148,6 +149,7 @@ class Faker:
         result._weights = copy.deepcopy(self._weights, memodict)
         result._unique_proxy = UniqueProxy(result)
         result._unique_proxy._seen = {k: {result._unique_proxy._sentinel} for k in self._unique_proxy._seen.keys()}
+        result._unique_proxy._domain_states = {}
         result._optional_proxy = OptionalProxy(result)
         return result
 
@@ -302,11 +304,13 @@ class UniqueProxy:
     def __init__(self, proxy: Faker, excluded_types: tuple[type, ...] = ()):
         self._proxy = proxy
         self._seen: dict = {}
+        self._domain_states: dict = {}
         self._sentinel = object()
         self._excluded_types = excluded_types
 
     def clear(self) -> None:
         self._seen = {}
+        self._domain_states = {}
 
     def exclude_types(self, types: list[type]) -> UniqueProxy:
         """Return new UniqueProxy excluding specified types from uniqueness checks.
@@ -326,6 +330,7 @@ class UniqueProxy:
         """
         new_proxy = UniqueProxy(self._proxy, tuple(types))
         new_proxy._seen = self._seen
+        new_proxy._domain_states = self._domain_states
         new_proxy._sentinel = self._sentinel
         return new_proxy
 
@@ -333,6 +338,7 @@ class UniqueProxy:
         locale_proxy = self._proxy[locale]
         unique_proxy = UniqueProxy(locale_proxy, self._excluded_types)
         unique_proxy._seen = self._seen
+        unique_proxy._domain_states = self._domain_states
         unique_proxy._sentinel = self._sentinel
         return unique_proxy
 
@@ -363,9 +369,45 @@ class UniqueProxy:
             return frozenset(self._make_hashable(v) for v in value)
         return value
 
+    def _make_domain_state(self, name: str, function: Callable, args: tuple, kwargs: dict) -> DomainSampler | None:
+        """Resolve the finite value domain declared for a provider method call.
+
+        A provider method ``foo`` declares its finite value domain through a
+        companion hook named ``_foo_unique_domain`` that accepts the same
+        arguments and returns a :class:`FiniteDomain`, or ``None`` when the
+        domain is infinite or unknown for the given arguments.
+        """
+        provider = getattr(function, "__self__", None)
+        hook = getattr(provider, f"_{name}_unique_domain", None) if provider is not None else None
+        if hook is None:
+            return None
+        domain: FiniteDomain | None = hook(*args, **kwargs)
+        if domain is None:
+            return None
+        return DomainSampler(domain, provider.generator.random)
+
     def _wrap(self, name: str, function: Callable) -> Callable:
         @functools.wraps(function)
         def wrapper(*args, **kwargs):
+            key = (name, args, tuple(sorted(kwargs.items())))
+
+            # Providers declaring a finite value domain are sampled uniformly
+            # without replacement, so uniqueness never depends on retry luck.
+            # Excluded types always use the retry-based logic below, since
+            # their values must not consume the domain.
+            if not self._excluded_types:
+                state = self._domain_states.get(key, self._sentinel)
+                if state is self._sentinel:
+                    state = self._make_domain_state(name, function, args, kwargs)
+                    self._domain_states[key] = state
+                if state is not None:
+                    if state.exhausted:
+                        raise UniquenessException(
+                            f"Exhausted all {state.domain.size:,} unique values for {name} "
+                            "with the given arguments."
+                        )
+                    return state.sample()
+
             # If types are excluded, call function once to check return type
             if self._excluded_types:
                 retval = function(*args, **kwargs)
@@ -375,7 +417,6 @@ class UniqueProxy:
                 # If not excluded, continue with normal uniqueness logic
                 # but we already have a value, so we'll use it if unique
                 hashable_retval = self._make_hashable(retval)
-                key = (name, args, tuple(sorted(kwargs.items())))
                 generated = self._seen.setdefault(key, {self._sentinel})
 
                 # Check if this first value is unique
@@ -385,7 +426,6 @@ class UniqueProxy:
                 # Not unique, continue with normal loop below
             else:
                 # No exclusions, use original logic
-                key = (name, args, tuple(sorted(kwargs.items())))
                 generated = self._seen.setdefault(key, {self._sentinel})
                 retval = self._sentinel
                 hashable_retval = self._make_hashable(retval)

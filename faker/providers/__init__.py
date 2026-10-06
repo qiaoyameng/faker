@@ -7,6 +7,7 @@ from typing import Any, Collection, List, Optional, Sequence, TypeVar, Union
 from ..generator import Generator
 from ..typing import OrderedDictType
 from ..utils.distribution import choices_distribution, choices_distribution_unique
+from ..utils.unique import FiniteDomain, IntegerRangeDomain
 
 _re_hash = re.compile(r"#")
 _re_perc = re.compile(r"%")
@@ -318,6 +319,19 @@ class BaseProvider:
         :sample: min=0, max=15, step=3
         """
         return self.generator.random.randrange(min, max + 1, step)
+
+    def _random_int_unique_domain(self, min: int = 0, max: int = 9999, step: int = 1) -> Optional[FiniteDomain[int]]:
+        """Declare the finite value domain of :meth:`random_int` for the ``unique`` proxy.
+
+        Returns ``None`` for argument combinations that do not describe a
+        non-empty integer range, in which case the ``unique`` proxy falls
+        back to its regular retry-based behavior.
+        """
+        if not all(isinstance(value, int) for value in (min, max, step)):
+            return None
+        if step < 1 or max < min:
+            return None
+        return IntegerRangeDomain(min, max, step)
 
     def random_digit(self) -> int:
         """Generate a random digit (0 to 9)."""

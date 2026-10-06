@@ -3,6 +3,7 @@ import re
 from itertools import product
 from typing import Dict, Optional, Pattern
 
+from ....utils.unique import FiniteDomain
 from .. import PrefixType
 from .. import Provider as BarcodeProvider
 
@@ -83,6 +84,20 @@ class Provider(BarcodeProvider):
                 prefixes = ((self.random_int(1, 9),),)
 
         return super().ean13(prefixes=prefixes)
+
+    def _ean13_unique_domain(
+        self,
+        prefixes: PrefixType = (),
+        leading_zero: Optional[bool] = None,
+    ) -> Optional[FiniteDomain[str]]:
+        if not prefixes:
+            if leading_zero is True:
+                prefixes = ((0,),)
+            elif leading_zero is False:
+                # The prefix is picked randomly on every call, so no fixed
+                # domain can be declared for this argument combination.
+                return None
+        return self._build_ean_domain(13, prefixes)
 
     def _convert_upc_a2e(self, upc_a: str) -> str:
         """Convert a 12-digit UPC-A barcode to its 8-digit UPC-E equivalent.

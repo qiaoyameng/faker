@@ -1,10 +1,60 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
+from ...utils.unique import FiniteDomain, PrefixedNumberDomain
 from .. import BaseProvider
 
 localized = True
 
 PrefixType = Tuple[Union[int, str, Tuple[Union[int, str], ...]], ...]
+
+
+def _ean_check_digit(body: str) -> int:
+    """Compute the EAN check digit for a string of body digits."""
+    weighted_sum = sum(int(digit) * (3 if index % 2 == 0 else 1) for index, digit in enumerate(reversed(body)))
+    return (10 - weighted_sum % 10) % 10
+
+
+def _normalize_ean_prefix(prefix: Union[int, str, Tuple[Union[int, str], ...]]) -> Optional[str]:
+    """Normalize a single EAN prefix to its digit string, or ``None`` if not possible."""
+    if isinstance(prefix, str):
+        parts = list(prefix)
+    elif isinstance(prefix, (tuple, list)):
+        parts = [str(part) for part in prefix]
+    else:
+        parts = [str(prefix)]
+    if not all(part.isdigit() and len(part) == 1 for part in parts):
+        return None
+    return "".join(parts)
+
+
+class EanDomain(FiniteDomain[str]):
+    """The finite domain of EAN codes of a fixed length sharing one fixed prefix."""
+
+    def __init__(self, length: int, prefix: str = "") -> None:
+        if length not in (8, 13):
+            raise ValueError("length can only be 8 or 13")
+        if len(prefix) >= length:
+            raise ValueError("prefix must be shorter than the code")
+        self.length = length
+        self.prefix = prefix
+        self._body = PrefixedNumberDomain(prefix, length - 1 - len(prefix))
+
+    @property
+    def size(self) -> int:
+        return self._body.size
+
+    def unrank(self, index: int) -> str:
+        body = self._body.unrank(index)
+        return body + str(_ean_check_digit(body))
+
+    def rank(self, value: str) -> int:
+        text = str(value)
+        if len(text) != self.length or not text.isdigit():
+            raise ValueError(f"{value!r} is not in the domain")
+        body, check_digit = text[:-1], int(text[-1])
+        if _ean_check_digit(body) != check_digit:
+            raise ValueError(f"{value!r} is not in the domain")
+        return self._body.rank(body)
 
 
 class Provider(BaseProvider):
@@ -27,16 +77,46 @@ class Provider(BaseProvider):
             prefix: str = self.random_element(prefixes)  # type: ignore[assignment]
             code[: len(prefix)] = map(int, prefix)
 
-        if length == 8:
-            weights = [3, 1, 3, 1, 3, 1, 3]
-        elif length == 13:
-            weights = [1, 3, 1, 3, 1, 3, 1, 3, 1, 3, 1, 3]
-
-        weighted_sum = sum(x * y for x, y in zip(code, weights))
-        check_digit = (10 - weighted_sum % 10) % 10
-        code.append(check_digit)
+        code.append(_ean_check_digit("".join(str(digit) for digit in code)))
 
         return "".join(str(x) for x in code)
+
+    def _ean_unique_domain(self, length: int = 13, prefixes: PrefixType = ()) -> Optional[FiniteDomain[str]]:
+        return self._build_ean_domain(length, prefixes)
+
+    def _ean8_unique_domain(self, prefixes: PrefixType = ()) -> Optional[FiniteDomain[str]]:
+        return self._build_ean_domain(8, prefixes)
+
+    def _ean13_unique_domain(self, prefixes: PrefixType = ()) -> Optional[FiniteDomain[str]]:
+        return self._build_ean_domain(13, prefixes)
+
+    def _localized_ean_unique_domain(self, length: int = 13) -> Optional[FiniteDomain[str]]:
+        return self._build_ean_domain(length, self.local_prefixes)
+
+    def _localized_ean8_unique_domain(self) -> Optional[FiniteDomain[str]]:
+        return self._build_ean_domain(8, self.local_prefixes)
+
+    def _localized_ean13_unique_domain(self) -> Optional[FiniteDomain[str]]:
+        return self._build_ean_domain(13, self.local_prefixes)
+
+    def _build_ean_domain(self, length: int, prefixes: PrefixType) -> Optional[FiniteDomain[str]]:
+        """Declare the finite value domain of an EAN variant for the ``unique`` proxy.
+
+        A domain can only be declared when the prefix is fixed, i.e. when no
+        prefixes or exactly one prefix is given.  Otherwise ``None`` is
+        returned and the ``unique`` proxy falls back to its regular
+        retry-based behavior.
+        """
+        if length not in (8, 13):
+            return None
+        if not prefixes:
+            return EanDomain(length)
+        if len(prefixes) != 1:
+            return None
+        prefix = _normalize_ean_prefix(prefixes[0])
+        if prefix is None or len(prefix) >= length:
+            return None
+        return EanDomain(length, prefix)
 
     def ean(self, length: int = 13, prefixes: PrefixType = ()) -> str:
         """Generate an EAN barcode of the specified ``length``.

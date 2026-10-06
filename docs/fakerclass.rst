@@ -354,6 +354,31 @@ be raised.
         fake.unique.boolean()  # UniquenessException!
 
 
+Some provider methods can declare their finite value domain through a size
+and a rank/unrank mapping, without enumerating every possible value.  For
+those methods (currently ``random_int`` and the EAN barcode generators with
+a fixed prefix), the ``.unique`` attribute samples uniformly and without
+replacement directly from the domain instead of retrying.  Memory usage
+grows with the number of values drawn, not with the size of the domain, and
+once every value has been drawn, a ``UniquenessException`` is raised
+immediately:
+
+
+.. code:: python
+
+   import faker
+
+   fake = faker.Faker()
+
+   numbers = {fake.unique.random_int(min=1, max=10) for i in range(10)}
+   assert numbers == set(range(1, 11))
+   fake.unique.random_int(min=1, max=10)  # UniquenessException!
+
+Each argument combination owns an independent exhaustion state, and
+``fake.unique.clear()`` resets it.  Provider methods without a declared
+finite domain keep the retry-based behavior described above.
+
+
 For types with limited value sets (like booleans with only 2 values), you can use
 ``exclude_types()`` to prevent uniqueness checks for specific types:
 

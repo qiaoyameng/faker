@@ -93,5 +93,6 @@ class TestUniquenessClass:
             assert value not in generated
             generated.add(value)
 
-        with pytest.raises(UniquenessException, match=r"Got duplicated values after [\d,]+ iterations."):
+        # random_int declares a finite domain, so exhaustion is reported directly
+        with pytest.raises(UniquenessException, match=r"Exhausted all [\d,]+ unique values"):
             fake.unique["ja_JP"].random_int(min=1, max=10)
