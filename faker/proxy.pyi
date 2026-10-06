@@ -1635,6 +1635,21 @@ class Faker:
 
     def latitude(self) -> Decimal: ...
     def latlng(self) -> Tuple[Decimal, Decimal]: ...
+    def latlng_in_region(
+        self,
+        region: Union[Tuple[float, float, float, float], Sequence[Tuple[float, float, float, float]]] = ...,
+        exclusions: Optional[
+            Union[Tuple[float, float, float, float], Sequence[Tuple[float, float, float, float]]]
+        ] = ...,
+    ) -> Tuple[Decimal, Decimal]: ...
+    def latlngs_in_region(
+        self,
+        region: Union[Tuple[float, float, float, float], Sequence[Tuple[float, float, float, float]]] = ...,
+        exclusions: Optional[
+            Union[Tuple[float, float, float, float], Sequence[Tuple[float, float, float, float]]]
+        ] = ...,
+        count: int = ...,
+    ) -> List[Tuple[Decimal, Decimal]]: ...
     def local_latlng(self, country_code: str = ..., coords_only: bool = ...) -> Optional[Tuple[str, ...]]:
         """
         Returns a location known to exist on land in a country specified by `country_code`.
@@ -1651,6 +1666,13 @@ class Faker:
         ...
 
     def longitude(self) -> Decimal: ...
+    def region_area(
+        self,
+        region: Union[Tuple[float, float, float, float], Sequence[Tuple[float, float, float, float]]] = ...,
+        exclusions: Optional[
+            Union[Tuple[float, float, float, float], Sequence[Tuple[float, float, float, float]]]
+        ] = ...,
+    ) -> float: ...
     def ascii_company_email(self) -> str: ...
     def ascii_email(self) -> str: ...
     def ascii_free_email(self) -> str: ...

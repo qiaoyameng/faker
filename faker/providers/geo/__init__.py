@@ -1,11 +1,204 @@
+import math
+
 from decimal import Decimal
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 from .. import BaseProvider
 
 localized = True
 
 PlaceType = Tuple[str, str, str, str, str]
+GeoRectangle = Tuple[float, float, float, float]
+GeoRectangles = Union[GeoRectangle, Sequence[GeoRectangle]]
+WORLD: GeoRectangle = (-90.0, 90.0, -180.0, 180.0)
+
+
+class _Rect:
+    """Rectangle expressed with non-wrapping longitude intervals."""
+
+    __slots__ = ("south", "north", "intervals")
+
+    def __init__(self, south: float, north: float, intervals: Tuple[Tuple[float, float], ...]):
+        self.south = south
+        self.north = north
+        self.intervals = intervals
+
+
+class _Cell:
+    __slots__ = ("south", "north", "west", "east", "area")
+
+    def __init__(self, south: float, north: float, west: float, east: float):
+        self.south = south
+        self.north = north
+        self.west = west
+        self.east = east
+        self.area = (math.sin(math.radians(north)) - math.sin(math.radians(south))) * math.radians(east - west)
+
+
+def _longitude_intervals(west: float, east: float) -> Tuple[Tuple[float, float], ...]:
+    """
+    Convert a canonical longitude interval to non-wrapping intervals in [0, 360].
+
+    ``(-180, 180)`` represents the complete longitude circle. A rectangle whose
+    eastern edge is smaller than its western edge crosses the antimeridian.
+    Equal canonical edges have zero width, including ``(180, -180)``.
+    """
+    if west == -180 and east == 180:
+        return ((0.0, 360.0),)
+
+    raw_west = west + 180.0
+    raw_east = east + 180.0
+    if east < west:
+        raw_east += 360.0
+
+    if raw_east <= 360.0:
+        return ((raw_west, raw_east),) if raw_west < raw_east else ()
+    return (
+        (raw_west, 360.0),
+        (0.0, raw_east - 360.0),
+    )
+
+
+def _normalize_rectangle(rectangle: GeoRectangle) -> Optional[_Rect]:
+    try:
+        south, north, west, east = rectangle
+    except (TypeError, ValueError) as exc:
+        raise TypeError("Each geographic rectangle must contain four numeric values.") from exc
+
+    values = [south, north, west, east]
+    if not all(isinstance(value, (int, float, Decimal)) for value in values):
+        raise TypeError("Each geographic rectangle must contain four numeric values.")
+
+    south = float(south)
+    north = float(north)
+    west = float(west)
+    east = float(east)
+
+    if not all(math.isfinite(value) for value in (south, north, west, east)):
+        raise ValueError("Geographic rectangle edges must be finite numbers.")
+    if not -90.0 <= south <= north <= 90.0:
+        raise ValueError("Latitude edges must satisfy -90 <= south <= north <= 90.")
+    if not -180.0 <= west <= 180.0 or not -180.0 <= east <= 180.0:
+        raise ValueError("Longitude edges must be between -180 and 180 degrees.")
+
+    intervals = _longitude_intervals(west, east)
+    if south == north or not intervals:
+        return None
+    return _Rect(south, north, intervals)
+
+
+def _normalize_rectangles(rectangles: Optional[Union[GeoRectangle, Sequence[GeoRectangle]]]) -> Tuple[_Rect, ...]:
+    if rectangles is None:
+        return ()
+    if (
+        isinstance(rectangles, Sequence)
+        and not isinstance(rectangles, (str, bytes))
+        and len(rectangles) == 4
+        and all(isinstance(value, (int, float, Decimal)) for value in rectangles)
+    ):
+        rectangles = [rectangles]  # type: ignore[list-item]
+
+    if not isinstance(rectangles, Sequence) or isinstance(rectangles, (str, bytes)):
+        raise TypeError("Geographic region must be a rectangle or sequence of rectangles.")
+
+    normalized = [_normalize_rectangle(rectangle) for rectangle in rectangles]
+    return tuple(rectangle for rectangle in normalized if rectangle is not None)
+
+
+def _merge_intervals(intervals: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if not intervals:
+        return []
+
+    ordered = sorted(intervals)
+    merged = [list(ordered[0])]
+    for start, end in ordered[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _subtract_intervals(
+    base: Sequence[Tuple[float, float]],
+    holes: Sequence[Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    result: List[Tuple[float, float]] = []
+    for base_start, base_end in base:
+        pieces = [(base_start, base_end)]
+        for hole_start, hole_end in holes:
+            next_pieces = []
+            for piece_start, piece_end in pieces:
+                overlap_start = max(piece_start, hole_start)
+                overlap_end = min(piece_end, hole_end)
+                if overlap_start >= overlap_end:
+                    next_pieces.append((piece_start, piece_end))
+                    continue
+                if piece_start < overlap_start:
+                    next_pieces.append((piece_start, overlap_start))
+                if overlap_end < piece_end:
+                    next_pieces.append((overlap_end, piece_end))
+            pieces = next_pieces
+        result.extend(pieces)
+    return _merge_intervals(result)
+
+
+def _intervals_for_slab(rectangles: Sequence[_Rect], south: float, north: float) -> List[Tuple[float, float]]:
+    intervals: List[Tuple[float, float]] = []
+    for rectangle in rectangles:
+        if rectangle.south <= south and north <= rectangle.north:
+            intervals.extend(rectangle.intervals)
+    return _merge_intervals(intervals)
+
+
+def _region_cells(inclusions: Sequence[_Rect], exclusions: Sequence[_Rect]) -> Tuple[_Cell, ...]:
+    latitudes = sorted(
+        {
+            latitude
+            for rectangle in (*inclusions, *exclusions)
+            for latitude in (rectangle.south, rectangle.north)
+        },
+    )
+
+    cells: List[_Cell] = []
+    for south, north in zip(latitudes, latitudes[1:]):
+        included = _intervals_for_slab(inclusions, south, north)
+        if not included:
+            continue
+        excluded = _intervals_for_slab(exclusions, south, north)
+        for west, east in _subtract_intervals(included, excluded):
+            if west < east:
+                cells.append(_Cell(south, north, west, east))
+    return tuple(cells)
+
+
+def _canonical_longitude(longitude: float) -> float:
+    longitude -= 180.0
+    if longitude > 180.0:
+        longitude -= 360.0
+    return longitude
+
+
+def _longitude_in_intervals(longitude: float, intervals: Sequence[Tuple[float, float]]) -> bool:
+    raw = longitude + 180.0
+    return any(start <= raw <= end for start, end in intervals)
+
+
+def _point_in_rectangles(latitude: float, longitude: float, rectangles: Sequence[_Rect]) -> bool:
+    return any(
+        rectangle.south <= latitude <= rectangle.north
+        and _longitude_in_intervals(longitude, rectangle.intervals)
+        for rectangle in rectangles
+    )
+
+
+def _resolve_region_cells(
+    inclusions: Optional[GeoRectangles],
+    exclusions: Optional[GeoRectangles] = None,
+) -> Tuple[_Cell, ...]:
+    included_rectangles = _normalize_rectangles(inclusions)
+    excluded_rectangles = _normalize_rectangles(exclusions)
+    return _region_cells(included_rectangles, excluded_rectangles)
 
 
 class Provider(BaseProvider):
@@ -1025,6 +1218,89 @@ class Provider(BaseProvider):
 
     def latlng(self) -> Tuple[Decimal, Decimal]:
         return (self.latitude(), self.longitude())
+
+    def region_area(
+        self,
+        region: GeoRectangles = WORLD,
+        exclusions: Optional[GeoRectangles] = None,
+    ) -> float:
+        """
+        Return the area of a rectangular region on a unit sphere in steradians.
+
+        Rectangles are ``(south_latitude, north_latitude, west_longitude,
+        east_longitude)``. An eastern longitude smaller than the western
+        longitude crosses the antimeridian. Overlapping inclusion rectangles
+        are counted once and exclusion rectangles are subtracted.
+        """
+        return sum(cell.area for cell in _resolve_region_cells(region, exclusions))
+
+    def latlng_in_region(
+        self,
+        region: GeoRectangles = WORLD,
+        exclusions: Optional[GeoRectangles] = None,
+    ) -> Tuple[Decimal, Decimal]:
+        """
+        Return one coordinate sampled uniformly by area from a rectangular region.
+
+        Rectangles are ``(south_latitude, north_latitude, west_longitude,
+        east_longitude)``. An eastern longitude smaller than the western
+        longitude crosses the antimeridian. Overlapping inclusion rectangles
+        are counted once and exclusion rectangles are removed.
+        """
+        return self.latlngs_in_region(region, exclusions=exclusions, count=1)[0]
+
+    def latlngs_in_region(
+        self,
+        region: GeoRectangles = WORLD,
+        exclusions: Optional[GeoRectangles] = None,
+        count: int = 1,
+    ) -> List[Tuple[Decimal, Decimal]]:
+        """
+        Return coordinates sampled uniformly by area from a rectangular region.
+
+        Rectangles are ``(south_latitude, north_latitude, west_longitude,
+        east_longitude)``. An eastern longitude smaller than the western
+        longitude crosses the antimeridian. Overlapping inclusion rectangles
+        are counted once and exclusion rectangles are removed.
+        """
+        count = int(count)
+        if count < 0:
+            raise ValueError("Count must be non-negative.")
+
+        cells = _resolve_region_cells(region, exclusions)
+        if count and not cells:
+            raise ValueError("Cannot sample from a region with zero spherical area.")
+
+        weights = tuple(cell.area for cell in cells)
+        included_rectangles = _normalize_rectangles(region)
+        excluded_rectangles = _normalize_rectangles(exclusions)
+        points = []
+        for _ in range(count):
+            for _ in range(100):
+                cell = self.generator.random.choices(cells, weights=weights)[0]
+                south_sine = math.sin(math.radians(cell.south))
+                north_sine = math.sin(math.radians(cell.north))
+                continuous_latitude = math.degrees(
+                    math.asin(self.generator.random.uniform(south_sine, north_sine)),
+                )
+                raw_longitude = self.generator.random.uniform(cell.west, cell.east)
+
+                decimal_latitude = Decimal(str(continuous_latitude)).quantize(Decimal(".000001"))
+                decimal_longitude = Decimal(str(_canonical_longitude(raw_longitude))).quantize(
+                    Decimal(".000001"),
+                )
+                point_latitude = float(decimal_latitude)
+                point_longitude = float(decimal_longitude)
+                included = _point_in_rectangles(point_latitude, point_longitude, included_rectangles)
+                excluded = _point_in_rectangles(point_latitude, point_longitude, excluded_rectangles)
+                if included and not excluded:
+                    break
+            else:
+                decimal_latitude = Decimal(str((cell.south + cell.north) / 2))
+                decimal_longitude = Decimal(str(_canonical_longitude((cell.west + cell.east) / 2)))
+
+            points.append((decimal_latitude, decimal_longitude))
+        return points
 
     def local_latlng(
         self,

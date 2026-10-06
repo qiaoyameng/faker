@@ -1,3 +1,4 @@
+import math
 import re
 import unittest
 
@@ -174,6 +175,118 @@ class TestGlobal(unittest.TestCase):
         assert len(loc_short) == 2
         assert Decimal(loc_short[0])
         assert Decimal(loc_short[1])
+
+
+class TestRegionSampling(unittest.TestCase):
+    def setUp(self):
+        self.fake = Faker()
+        self.fake.seed_instance(12345)
+
+    @staticmethod
+    def spherical_area(south, north, longitude_width):
+        return math.radians(longitude_width) * (
+            math.sin(math.radians(north)) - math.sin(math.radians(south))
+        )
+
+    def test_region_area_overlaps_once_and_removes_exclusions(self):
+        equatorial_band = (-10, 10, -180, 180)
+        polar_band = (60, 80, -180, 180)
+        cross_dateline_band = (-30, -20, 170, -170)
+        dateline_hole = (-27, -23, 176, -176)
+
+        equatorial_area = self.spherical_area(-10, 10, 360)
+        polar_area = self.spherical_area(60, 80, 360)
+        cross_area = self.spherical_area(-30, -20, 20)
+        hole_area = self.spherical_area(-27, -23, 8)
+
+        assert self.fake.region_area([equatorial_band, equatorial_band]) == equatorial_area
+        assert self.fake.region_area(cross_dateline_band, dateline_hole) == cross_area - hole_area
+
+        total_area = equatorial_area + polar_area + cross_area - hole_area
+        region = [equatorial_band, polar_band, cross_dateline_band]
+        assert math.isclose(self.fake.region_area(region, dateline_hole), total_area)
+
+    def test_samples_match_ranges_holes_and_spherical_area_proportions(self):
+        equatorial_band = (-10, 10, -180, 180)
+        polar_band = (60, 80, -180, 180)
+        cross_dateline_band = (-30, -20, 170, -170)
+        dateline_hole = (-27, -23, 176, -176)
+        region = [equatorial_band, polar_band, cross_dateline_band]
+
+        point = self.fake.latlng_in_region(cross_dateline_band, dateline_hole)
+        assert isinstance(point, tuple)
+        assert all(isinstance(coordinate, Decimal) for coordinate in point)
+
+        sample_size = 30000
+        points = self.fake.latlngs_in_region(region, exclusions=dateline_hole, count=sample_size)
+        assert len(points) == sample_size
+
+        counts = {
+            "equatorial": 0,
+            "polar": 0,
+            "cross_dateline": 0,
+        }
+        seen_east_of_dateline = False
+        seen_west_of_dateline = False
+
+        for latitude, longitude in points:
+            latitude = float(latitude)
+            longitude = float(longitude)
+            assert -90 <= latitude <= 90
+            assert -180 <= longitude <= 180
+
+            if -10 <= latitude <= 10:
+                counts["equatorial"] += 1
+            elif 60 <= latitude <= 80:
+                counts["polar"] += 1
+            elif -30 <= latitude <= -20 and (longitude >= 170 or longitude <= -170):
+                counts["cross_dateline"] += 1
+            else:
+                raise AssertionError("Coordinate was sampled outside the configured region")
+
+            in_hole = -27 <= latitude <= -23 and (longitude >= 176 or longitude <= -176)
+            assert not in_hole
+            if -30 <= latitude <= -20:
+                seen_east_of_dateline = seen_east_of_dateline or longitude >= 170
+                seen_west_of_dateline = seen_west_of_dateline or longitude <= -170
+
+        assert seen_east_of_dateline
+        assert seen_west_of_dateline
+
+        areas = {
+            "equatorial": self.spherical_area(-10, 10, 360),
+            "polar": self.spherical_area(60, 80, 360),
+            "cross_dateline": self.spherical_area(-30, -20, 20)
+            - self.spherical_area(-27, -23, 8),
+        }
+        total_area = sum(areas.values())
+        tolerance = 0.012
+        for name, area in areas.items():
+            assert abs(counts[name] / sample_size - area / total_area) < tolerance
+
+    def test_zero_area_and_fully_excluded_region(self):
+        assert self.fake.region_area((90, 90, -180, 180)) == 0
+        assert self.fake.region_area((0, 1, -180, 180), (0, 1, -180, 180)) == 0
+        assert self.fake.latlngs_in_region((0, 0, -180, 180), count=0) == []
+
+        with self.assertRaises(ValueError):
+            self.fake.latlng_in_region((90, 90, -180, 180))
+        with self.assertRaises(ValueError):
+            self.fake.latlng_in_region(
+                (0, 1, -180, 180),
+                (0, 1, -180, 180),
+            )
+
+    def test_pole_region_and_invalid_rectangles(self):
+        points = self.fake.latlngs_in_region((89, 90, -180, 180), count=100)
+        assert all(89 <= float(latitude) <= 90 for latitude, _ in points)
+
+        with self.assertRaises(ValueError):
+            self.fake.latlng_in_region((91, 90, -180, 180))
+        with self.assertRaises(ValueError):
+            self.fake.latlng_in_region((0, 1, -181, 180))
+        with self.assertRaises(TypeError):
+            self.fake.latlng_in_region((0, 1, 0))
 
 
 class TestPlPl(unittest.TestCase):
