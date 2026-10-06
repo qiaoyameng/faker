@@ -2,11 +2,14 @@ import re
 import string
 
 from collections import OrderedDict
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any, Collection, List, Optional, Sequence, TypeVar, Union
 
 from ..generator import Generator
 from ..typing import OrderedDictType
 from ..utils.distribution import choices_distribution, choices_distribution_unique
+from ..utils.quota import categorical_quota_matrix as build_categorical_quota_matrix
+from ..utils.quota import iter_categorical_records
 
 _re_hash = re.compile(r"#")
 _re_perc = re.compile(r"%")
@@ -566,6 +569,51 @@ class BaseProvider:
         :sample: elements=('a', 'b', 'c', 'd', 'e', 'f'), length=3
         """
         return self.random_elements(elements, length, unique=True)
+
+    def categorical_quota_matrix(
+        self,
+        row_quotas: Optional[Mapping[Any, int]] = None,
+        column_quotas: Optional[Mapping[Any, int]] = None,
+        forbidden_pairs: Union[Collection[Sequence[Any]], Mapping[Sequence[Any], object]] = (),
+    ) -> dict[Any, dict[Any, int]]:
+        """Build exact joint counts for two categorical quota dimensions.
+
+        Row and column totals are preserved. Each ``forbidden_pairs`` item is a
+        ``(row, column)`` tuple whose joint count must be zero. Feasibility is
+        checked deterministically with an integer max-flow calculation; sampling
+        is not retried. When no integer matrix exists,
+        :class:`~faker.exceptions.InfeasibleQuotaError` contains a min-cut
+        witness and the reproducible supply/demand shortfall.
+        """
+        return build_categorical_quota_matrix(row_quotas, column_quotas, forbidden_pairs)
+
+    def random_categorical_records(
+        self,
+        row_quotas: Optional[Mapping[Any, int]] = None,
+        column_quotas: Optional[Mapping[Any, int]] = None,
+        forbidden_pairs: Union[Collection[Sequence[Any]], Mapping[Sequence[Any], object]] = (),
+        row_key: str = "row",
+        column_key: str = "column",
+        extra_fields: Optional[Callable[[Any, Any], Mapping[str, Any]]] = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield shuffled records satisfying two categorical quota mappings.
+
+        The iterator first finds one feasible joint-count matrix, then emits
+        ``row_key``/``column_key`` records without materializing all rows. Random
+        ordering uses this Faker instance's random source and is reproducible
+        after ``seed_instance``; it is a reproducible weighted order rather than
+        a promise of uniform distribution over every feasible matrix or order.
+        ``extra_fields`` is called once per emitted record for ordinary provider
+        fields.
+        """
+        matrix = self.categorical_quota_matrix(row_quotas, column_quotas, forbidden_pairs)
+        return iter_categorical_records(
+            matrix,
+            self.generator.random,
+            row_key=row_key,
+            column_key=column_key,
+            extra_fields=extra_fields,
+        )
 
     def randomize_nb_elements(
         self,

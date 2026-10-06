@@ -16,6 +16,7 @@ from typing import (
     Iterator,
     List,
     Literal,
+    Mapping,
     Optional,
     Sequence,
     Set,
@@ -421,6 +422,25 @@ class Faker:
         :sample: elements=('a', 'b', 'c', 'd', 'e', 'f')
         :sample: elements=('a', 'b', 'c', 'd', 'e', 'f'), length=3
         """
+        ...
+
+    def categorical_quota_matrix(
+        self,
+        row_quotas: Optional[Mapping[Any, int]] = ...,
+        column_quotas: Optional[Mapping[Any, int]] = ...,
+        forbidden_pairs: Union[Collection[Sequence[Any]], Mapping[Sequence[Any], object]] = ...,
+    ) -> Dict[Any, Dict[Any, int]]:
+        ...
+
+    def random_categorical_records(
+        self,
+        row_quotas: Optional[Mapping[Any, int]] = ...,
+        column_quotas: Optional[Mapping[Any, int]] = ...,
+        forbidden_pairs: Union[Collection[Sequence[Any]], Mapping[Sequence[Any], object]] = ...,
+        row_key: str = ...,
+        column_key: str = ...,
+        extra_fields: Optional[Callable[[Any, Any], Mapping[str, Any]]] = ...,
+    ) -> Iterator[Dict[str, Any]]:
         ...
 
     def random_uppercase_letter(self) -> str:
