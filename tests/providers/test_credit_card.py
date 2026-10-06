@@ -1,10 +1,32 @@
+import itertools
 import re
 
 from typing import Pattern
 
+import pytest
+
 from faker.providers.bank.ru_RU import Provider as RuRuBankProvider
 from faker.providers.bank.uk_UA import Provider as UkUaBankProvider
 from faker.providers.credit_card import Provider as CreditCardProvider
+
+
+def luhn_valid(number: str) -> bool:
+    total = 0
+    for pos, char in enumerate(reversed(number)):
+        if pos % 2 == 1:
+            total += CreditCardProvider.luhn_lookup[char]
+        else:
+            total += int(char)
+    return total % 10 == 0
+
+
+def exhaustive_valid_numbers(mask) -> set:
+    positions = ["0123456789" if position is None else str(position) for position in mask]
+    return {
+        "".join(combination)
+        for combination in itertools.product(*positions)
+        if luhn_valid("".join(combination))
+    }
 
 
 class TestCreditCardProvider:
@@ -218,3 +240,76 @@ class TestZhCn:
             card_data = faker.credit_card_full("unionpay").split("\n")
             assert re.match(r"[\u4e00-\u9fff]+", card_data[1])  # Check if owner has Chinese characters
             assert card_data[0] == "UnionPay"  # Ensure correct provider name
+
+
+class TestCreditCardNumberMask:
+    """Test per-position digit mask generation and counting"""
+
+    short_masks = [
+        ["4", "9", "27", None, "0"],
+        ["0", "0", None, None, "5"],
+        [None, "13", None, "7"],
+        ["6", "011", None, None, None, "89"],
+    ]
+
+    def test_mask_count_matches_exhaustive(self, faker):
+        provider = CreditCardProvider(faker)
+        for mask in self.short_masks:
+            expected = exhaustive_valid_numbers(mask)
+            assert provider.credit_card_number_mask_count(mask) == len(expected)
+
+    def test_mask_count_fully_fixed(self, faker):
+        provider = CreditCardProvider(faker)
+        valid = next(iter(exhaustive_valid_numbers(["4", "9", "27", None, "0"])))
+        assert provider.credit_card_number_mask_count(list(valid)) == 1
+        invalid = valid[:-1] + str((int(valid[-1]) + 1) % 10)
+        assert provider.credit_card_number_mask_count(list(invalid)) == 0
+
+    def test_generated_numbers_cover_exhaustive_set(self, faker):
+        provider = CreditCardProvider(faker)
+        for mask in self.short_masks:
+            expected = exhaustive_valid_numbers(mask)
+            samples = {provider.credit_card_number_from_mask(mask) for _ in range(50 * len(expected))}
+            assert samples <= expected
+            assert samples == expected
+
+    def test_generated_numbers_preserve_fixed_positions_and_leading_zeros(self, faker, num_samples):
+        provider = CreditCardProvider(faker)
+        mask = ["0", "0", "27", None, None, "5"]
+        for _ in range(num_samples):
+            number = provider.credit_card_number_from_mask(mask)
+            assert len(number) == len(mask)
+            assert number.startswith("00")
+            assert number[2] in "27"
+            assert number.endswith("5")
+            assert luhn_valid(number)
+
+    def test_long_mask_count_does_not_enumerate(self, faker):
+        provider = CreditCardProvider(faker)
+        mask = ["4", "9"] + [None] * 37 + ["0"]
+        assert provider.credit_card_number_mask_count(mask) == 10**36
+        restricted = ["5", None] * 12 + ["0"]
+        assert provider.credit_card_number_mask_count(restricted) == 10**11
+
+    def test_long_mask_generation(self, faker, num_samples):
+        provider = CreditCardProvider(faker)
+        mask = ["4", "9"] + [None] * 37 + ["0"]
+        for _ in range(num_samples):
+            number = provider.credit_card_number_from_mask(mask)
+            assert len(number) == 40
+            assert number.startswith("49")
+            assert number.endswith("0")
+            assert luhn_valid(number)
+
+    def test_invalid_masks_raise_value_error(self, faker):
+        provider = CreditCardProvider(faker)
+        for mask in ([], ["4", ""], ["4", "12x"], ["4", 10], ["4", [-1]], ["4", []]):
+            with pytest.raises(ValueError):
+                provider.credit_card_number_mask_count(mask)
+
+    def test_mask_without_valid_numbers(self, faker):
+        provider = CreditCardProvider(faker)
+        mask = list("1234567890123453")
+        assert provider.credit_card_number_mask_count(mask) == 0
+        with pytest.raises(ValueError):
+            provider.credit_card_number_from_mask(mask)

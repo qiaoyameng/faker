@@ -1,10 +1,14 @@
 from collections import OrderedDict
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from ...typing import CardType, CreditCard, DateParseType
 from .. import BaseProvider
 
 localized = True
+
+# Each position of a digit mask is either ``None`` (any digit), a single digit
+# (``int`` or one-character ``str``), or an iterable of allowed digits.
+MaskPositionType = Union[None, int, str, Iterable[int]]
 
 
 class Provider(BaseProvider):
@@ -161,6 +165,51 @@ class Provider(BaseProvider):
         sec_len = self._credit_card_type(card_type).security_code_length
         return self.numerify("#" * sec_len)
 
+    def credit_card_number_from_mask(self, mask: Sequence[MaskPositionType]) -> str:
+        """Generate a Luhn-valid number matching a per-position digit mask.
+
+        Each element of ``mask`` describes the digits allowed at that position:
+        ``None`` allows any digit, an ``int`` or one-character ``str`` fixes the
+        digit, and any other iterable (e.g. ``"27"`` or ``[2, 7]``) restricts
+        the position to the given set of digits. For example, ``["4", "9",
+        "27", None, "0"]`` describes five-digit numbers starting with ``49``,
+        whose third digit is ``2`` or ``7`` and that end in ``0``.
+
+        The result is sampled uniformly from all mask-compliant, Luhn-valid
+        numbers of the mask's length, preserving leading zeros. A ``ValueError``
+        is raised if the mask is malformed or admits no valid number.
+        """
+        allowed_digits = self._normalize_digit_mask(mask)
+        counts = self._luhn_mask_counts(allowed_digits)
+        if counts[0][0] == 0:
+            raise ValueError("The supplied mask does not allow any Luhn-valid number")
+        length = len(allowed_digits)
+        number = []
+        needed = 0
+        for pos in range(length):
+            doubled = (length - 1 - pos) % 2 == 1
+            digits = allowed_digits[pos]
+            weights = []
+            for digit in digits:
+                contribution = self.luhn_lookup[str(digit)] if doubled else digit
+                weights.append(counts[pos + 1][(needed - contribution) % 10])
+            chosen = self.generator.random.choices(digits, weights=weights, k=1)[0]
+            number.append(str(chosen))
+            contribution = self.luhn_lookup[str(chosen)] if doubled else chosen
+            needed = (needed - contribution) % 10
+        return "".join(number)
+
+    def credit_card_number_mask_count(self, mask: Sequence[MaskPositionType]) -> int:
+        """Count the Luhn-valid numbers matching a per-position digit mask.
+
+        The ``mask`` argument follows the same format as
+        |credit_card_number_from_mask|. The count is computed with a dynamic
+        program over the Luhn checksum, so even masks admitting a huge number
+        of valid values are handled without enumerating them.
+        """
+        allowed_digits = self._normalize_digit_mask(mask)
+        return self._luhn_mask_counts(allowed_digits)[0][0]
+
     def _credit_card_type(self, card_type: Optional[CardType] = None) -> CreditCard:
         """Generate a random CreditCard instance of the specified card type."""
         if card_type is None:
@@ -168,6 +217,54 @@ class Provider(BaseProvider):
         elif isinstance(card_type, CreditCard):
             return card_type
         return self.credit_card_types[card_type]  # type: ignore[index]
+
+    @staticmethod
+    def _normalize_digit_mask(mask: Sequence[MaskPositionType]) -> List[Tuple[int, ...]]:
+        """Validate ``mask`` and return the sorted allowed digits per position."""
+        if not mask:
+            raise ValueError("The digit mask must contain at least one position")
+        normalized = []
+        for position in mask:
+            if position is None:
+                normalized.append(tuple(range(10)))
+                continue
+            if isinstance(position, int):
+                candidates: Iterable[int] = (position,)
+            else:
+                try:
+                    candidates = tuple(position)
+                except TypeError:
+                    raise ValueError(f"Invalid digit mask position: {position!r}") from None
+            try:
+                digits = sorted({int(digit) for digit in candidates})
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid digit mask position: {position!r}") from None
+            if not digits or digits[0] < 0 or digits[-1] > 9:
+                raise ValueError(f"Invalid digit mask position: {position!r}")
+            normalized.append(tuple(digits))
+        return normalized
+
+    @classmethod
+    def _luhn_mask_counts(cls, allowed_digits: List[Tuple[int, ...]]) -> List[List[int]]:
+        """Count mask-compliant completions by position and checksum residue.
+
+        ``counts[pos][residue]`` is the number of ways to fill positions
+        ``pos`` onwards so that their Luhn contributions sum to ``residue``
+        modulo 10, hence ``counts[0][0]`` is the total number of Luhn-valid
+        numbers matching the mask.
+        """
+        length = len(allowed_digits)
+        counts = [[0] * 10 for _ in range(length + 1)]
+        counts[length][0] = 1
+        for pos in range(length - 1, -1, -1):
+            doubled = (length - 1 - pos) % 2 == 1
+            for residue in range(10):
+                total = 0
+                for digit in allowed_digits[pos]:
+                    contribution = cls.luhn_lookup[str(digit)] if doubled else digit
+                    total += counts[pos + 1][(residue - contribution) % 10]
+                counts[pos][residue] = total
+        return counts
 
     def _generate_number(self, prefix: str, length: int) -> str:
         """Generate a credit card number.
