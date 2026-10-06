@@ -204,6 +204,39 @@ factory/selection logic in this order:
 6. If there is more than one applicable generator, and weights were provided, randomly select
    a generator using a distribution defined by the provided weights.
 
+Record Locale Scope
+~~~~~~~~~~~~~~~~~~~
+
+Sometimes a record must use one locale for every field. The ``record()`` context manager selects
+that locale once when entering the scope, instead of selecting a factory separately for each
+provider method.
+
+.. code:: python
+
+    from faker import Faker
+
+    fake = Faker(['en_US', 'fr_FR', 'en_PH'])
+
+    # Selects one locale whose factory supports both methods, then uses it
+    # for both fields.
+    with fake.record(['name', 'postcode']) as record:
+        data = {
+            'name': record.name(),
+            'postcode': record.postcode(),
+        }
+
+Provider method requirements may be passed as method names or as dotted provider module paths.
+Locales are selected from only the configured factories that satisfy every requirement. If none of
+them do, an ``AttributeError`` reports the providers missing from each locale. An explicit locale
+may also be selected with the ``locale`` argument; hyphenated locale codes are normalized as
+usual.
+
+Inside the scope, provider methods that are supplied by a fallback locale instead of the selected
+locale are not available. This keeps a temporarily called method from silently switching the
+record's language. Normal method-by-method factory selection resumes when the scope exits, including
+when the body raises an exception. Record scopes may be nested, and an inner scope may select its
+own locale; exiting the inner scope restores the outer record's locale.
+
 Other than being able to customize probabilities based on locales and minimizing performance
 penalties, the factory selection logic guarantees that invoking a provider method will not fail,
 for as long as at least there is at least one internal ``Generator`` object supports it.

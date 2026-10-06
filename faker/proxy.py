@@ -4,9 +4,10 @@ import copy
 import functools
 import re
 
+from collections.abc import Iterable, Mapping
 from collections import OrderedDict
 from random import Random
-from typing import Any, Callable, Pattern, Sequence, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Pattern, Sequence, TypeVar
 
 from .config import DEFAULT_LOCALE
 from .exceptions import UniquenessException
@@ -14,6 +15,9 @@ from .factory import Factory
 from .generator import Generator
 from .typing import SeedType
 from .utils.distribution import choices_distribution
+
+if TYPE_CHECKING:
+    from .providers import BaseProvider
 
 _UNIQUE_ATTEMPTS = 1000
 
@@ -41,6 +45,7 @@ class Faker:
         self._weights = None
         self._unique_proxy = UniqueProxy(self)
         self._optional_proxy = OptionalProxy(self)
+        self._record_scopes: list[_RecordScope] = []
 
         if isinstance(locale, str):
             locales = [locale.replace("-", "_")]
@@ -126,6 +131,14 @@ class Faker:
         :param attr: attribute name
         :return: the appropriate attribute
         """
+        try:
+            record_scopes = object.__getattribute__(self, "_record_scopes")
+        except AttributeError:
+            record_scopes = []
+
+        if record_scopes:
+            return self._get_record_attribute(record_scopes[-1], attr)
+
         if len(self._factories) == 1:
             return getattr(self._factories[0], attr)
         elif attr in self.generator_attrs:
@@ -146,6 +159,7 @@ class Faker:
         result._factory_map = copy.deepcopy(self._factory_map, memodict)
         result._factories = list(result._factory_map.values())
         result._weights = copy.deepcopy(self._weights, memodict)
+        result._record_scopes = []
         result._unique_proxy = UniqueProxy(result)
         result._unique_proxy._seen = {k: {result._unique_proxy._sentinel} for k in self._unique_proxy._seen.keys()}
         result._optional_proxy = OptionalProxy(result)
@@ -153,6 +167,180 @@ class Faker:
 
     def __setstate__(self, state: Any) -> None:
         self.__dict__.update(state)
+        self._record_scopes = getattr(self, "_record_scopes", [])
+
+    def record(
+        self,
+        providers: str | Iterable[str] | None = None,
+        *,
+        locale: str | None = None,
+        provider_names: str | Iterable[str] | None = None,
+        required_providers: str | Iterable[str] | None = None,
+        provider_methods: str | Iterable[str] | None = None,
+    ) -> ContextManager["_RecordScope"]:
+        """Return a scope in which all provider calls use one locale."""
+        provider_args = [
+            providers,
+            provider_names,
+            required_providers,
+            provider_methods,
+        ]
+        if sum(arg is not None for arg in provider_args) > 1:
+            raise ValueError("Only one collection of required record providers may be supplied.")
+
+        required = next((arg for arg in provider_args if arg is not None), None)
+        required = self._normalize_record_providers(required)
+        record_locale, factory = self._select_record_factory(locale, required)
+        return _RecordScope(self, record_locale, factory)
+
+    record_scope = record
+
+    @staticmethod
+    def _normalize_record_providers(providers: str | Iterable[str] | None) -> list[str]:
+        if providers is None:
+            return []
+        if isinstance(providers, str):
+            provider_names = [providers]
+        elif isinstance(providers, Iterable) and not isinstance(providers, (bytes, bytearray)):
+            provider_names = list(providers)
+        else:
+            raise TypeError("Required record providers must be a string or an iterable of strings.")
+
+        if not all(isinstance(provider_name, str) for provider_name in provider_names):
+            raise TypeError("Required record provider names must be strings.")
+
+        normalized_names = []
+        for provider_name in provider_names:
+            if provider_name not in normalized_names:
+                normalized_names.append(provider_name)
+        return normalized_names
+
+    def _select_record_factory(
+        self,
+        locale: str | None,
+        required_providers: Sequence[str],
+    ) -> tuple[str, Generator | Faker]:
+        if locale is not None:
+            if not isinstance(locale, str):
+                raise TypeError("Record locale must be a string.")
+            normalized_locale = locale.replace("-", "_")
+            if normalized_locale not in self._factory_map:
+                msg = f"Invalid configuration for record locale `{normalized_locale}`"
+                raise AttributeError(msg)
+
+            factory = self._factory_map[normalized_locale]
+            missing_providers = [
+                provider_name
+                for provider_name in required_providers
+                if not self._record_supports(factory, normalized_locale, provider_name)
+            ]
+            if missing_providers:
+                details = self._format_missing_report({normalized_locale: missing_providers})
+                msg = f"No configured locale provides all required record providers: {details}"
+                raise AttributeError(msg)
+            return normalized_locale, factory
+
+        eligible_factories = []
+        missing_by_locale = OrderedDict()
+        for candidate_locale, factory in self._factory_map.items():
+            missing_providers = [
+                provider_name
+                for provider_name in required_providers
+                if not self._record_supports(factory, candidate_locale, provider_name)
+            ]
+            if missing_providers:
+                missing_by_locale[candidate_locale] = missing_providers
+            else:
+                eligible_factories.append(factory)
+
+        if not eligible_factories:
+            details = self._format_missing_report(missing_by_locale)
+            msg = f"No configured locale provides all required record providers: {details}"
+            raise AttributeError(msg)
+
+        if len(eligible_factories) == 1:
+            factory = eligible_factories[0]
+        elif self._weights:
+            random_factory = eligible_factories[0]
+            if isinstance(random_factory, Faker) and len(random_factory.factories) == 1:
+                random_factory = random_factory.factories[0]
+            weights = [
+                weight
+                for candidate_factory, weight in zip(self._factories, self._weights)
+                if any(candidate_factory is eligible_factory for eligible_factory in eligible_factories)
+            ]
+            factory = choices_distribution(eligible_factories, weights, random_factory.random, length=1)[0]
+        else:
+            factory = self._select_factory_choice(eligible_factories)
+
+        record_locale = next(
+            candidate_locale
+            for candidate_locale, candidate_factory in self._factory_map.items()
+            if candidate_factory is factory
+        )
+        return record_locale, factory
+
+    @staticmethod
+    def _format_missing_report(missing_by_locale: Mapping[str, Sequence[str]]) -> str:
+        return "; ".join(
+            f"{locale} is missing {', '.join(missing_providers)}"
+            for locale, missing_providers in missing_by_locale.items()
+        )
+
+    @classmethod
+    def _record_supports(cls, factory: Generator | Faker, locale: str, provider_name: str) -> bool:
+        if isinstance(factory, Faker):
+            if len(factory.factories) != 1:
+                return False
+            factory = factory.factories[0]
+
+        if "." in provider_name:
+            provider = None
+            if hasattr(factory, "provider"):
+                provider = factory.provider(provider_name)
+            if provider is None:
+                return False
+            provider_language = getattr(provider, "__lang__", None)
+            return provider_language is None or provider_language == locale
+
+        method = getattr(factory, provider_name, None)
+        if not callable(method):
+            return False
+
+        owner = getattr(method, "__self__", None)
+        if owner is factory:
+            factory_language = getattr(factory, "__lang__", None)
+            return factory_language is None or factory_language == locale
+
+        for provider in cls._record_providers(factory):
+            if getattr(provider, provider_name, None) != method:
+                continue
+            provider_language = getattr(provider, "__lang__", None)
+            return provider_language is None or provider_language == locale
+        return False
+
+    @staticmethod
+    def _record_providers(factory: Generator | Faker) -> list[BaseProvider]:
+        get_providers = getattr(factory, "get_providers", None)
+        if not callable(get_providers):
+            return []
+        providers = get_providers()
+        return list(providers) if providers is not None else []
+
+    @classmethod
+    def _get_record_attribute(cls, scope: "_RecordScope", attr: str) -> Any:
+        try:
+            value = getattr(scope.factory, attr)
+        except AttributeError as exc:
+            if not cls._record_supports(scope.factory, scope.locale, attr):
+                msg = f"Record locale {scope.locale!r} does not provide {attr!r}."
+                raise AttributeError(msg) from exc
+            raise
+
+        if callable(value) and not cls._record_supports(scope.factory, scope.locale, attr):
+            msg = f"Record locale {scope.locale!r} does not provide {attr!r}."
+            raise AttributeError(msg)
+        return value
 
     @property
     def unique(self) -> UniqueProxy:
@@ -260,6 +448,9 @@ class Faker:
         implement desired behavior in multiple locale mode.
         """
 
+        if self._record_scopes:
+            return self._record_scopes[-1].factory.random
+
         if len(self._factories) == 1:
             return self._factories[0].random
         else:
@@ -275,6 +466,10 @@ class Faker:
         of the only internal `Generator` object. Subclasses will have to
         implement desired behavior in multiple locale mode.
         """
+
+        if self._record_scopes:
+            self._record_scopes[-1].factory.random = value
+            return
 
         if len(self._factories) == 1:
             self._factories[0].random = value
@@ -296,6 +491,64 @@ class Faker:
 
     def items(self) -> list[tuple[str, Generator | Faker]]:
         return list(self._factory_map.items())
+
+
+class _RecordScope:
+    def __init__(self, proxy: Faker, locale: str, factory: Generator | Faker) -> None:
+        self._proxy = proxy
+        self._locale = locale
+        self._factory = factory
+
+    def __enter__(self) -> "_RecordScope":
+        self._proxy._record_scopes.append(self)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        scopes = self._proxy._record_scopes
+        if not scopes or scopes[-1] is not self:
+            msg = "Record scope exited in the wrong order."
+            raise RuntimeError(msg)
+        scopes.pop()
+
+    def __getattr__(self, attr: str) -> Any:
+        try:
+            scopes = object.__getattribute__(self, "_proxy")._record_scopes
+        except AttributeError as exc:
+            raise AttributeError(attr) from exc
+
+        if not scopes or scopes[-1] is not self:
+            msg = "Record scope is not active."
+            raise RuntimeError(msg)
+        return Faker._get_record_attribute(self, attr)
+
+    @property
+    def proxy(self) -> Faker:
+        return self._proxy
+
+    @property
+    def locale(self) -> str:
+        return self._locale
+
+    @property
+    def record_locale(self) -> str:
+        return self._locale
+
+    @property
+    def factory(self) -> Generator | Faker:
+        return self._factory
+
+    @property
+    def unique(self) -> UniqueProxy:
+        return self._proxy.unique
+
+    @property
+    def optional(self) -> OptionalProxy:
+        return self._proxy.optional
+
+    def record(self, *args: Any, **kwargs: Any) -> ContextManager["_RecordScope"]:
+        return self._proxy.record(*args, **kwargs)
+
+    record_scope = record
 
 
 class UniqueProxy:
@@ -436,6 +689,11 @@ class OptionalProxy:
         def wrapper(*args: Any, prob: float = 0.5, **kwargs: Any) -> RetType | None:
             if not 0 < prob <= 1.0:
                 raise ValueError("prob must be between 0 and 1")
+            record_scopes = getattr(self._proxy, "_record_scopes", [])
+            if record_scopes:
+                enabled = record_scopes[-1].factory.random.randint(1, 100) <= prob * 100
+                return function(*args, **kwargs) if enabled else None
+
             return function(*args, **kwargs) if self._proxy.boolean(chance_of_getting_true=int(prob * 100)) else None
 
         return wrapper

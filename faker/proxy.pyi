@@ -11,6 +11,7 @@ from typing import (
     Any,
     Callable,
     Collection,
+    ContextManager,
     Dict,
     Iterable,
     Iterator,
@@ -4907,6 +4908,24 @@ class Faker:
         ...
 
     def __setstate__(self, state: "Any") -> "None": ...
+    def record(
+        self,
+        providers: "str | Iterable[str] | None" = ...,
+        *,
+        locale: "str | None" = ...,
+        provider_names: "str | Iterable[str] | None" = ...,
+        required_providers: "str | Iterable[str] | None" = ...,
+        provider_methods: "str | Iterable[str] | None" = ...
+    ) -> "ContextManager[Any]": ...
+    def record_scope(
+        self,
+        providers: "str | Iterable[str] | None" = ...,
+        *,
+        locale: "str | None" = ...,
+        provider_names: "str | Iterable[str] | None" = ...,
+        required_providers: "str | Iterable[str] | None" = ...,
+        provider_methods: "str | Iterable[str] | None" = ...
+    ) -> "ContextManager[Any]": ...
     def items(self) -> "list[tuple[str, Generator | Faker]]": ...
     @staticmethod
     def seed(seed: "SeedType | None" = ...) -> "None":

@@ -12,6 +12,51 @@ from faker.config import DEFAULT_LOCALE
 from faker.generator import Generator
 
 
+class AlphaRecordFactory:
+    def __init__(self, locale):
+        self.random = random.Random()
+        setattr(self, "__lang__", locale)
+
+    def get_providers(self):
+        return [self]
+
+    def alpha(self):
+        return getattr(self, "__lang__")
+
+    def shared(self):
+        return getattr(self, "__lang__")
+
+
+class BetaRecordFactory:
+    def __init__(self, locale):
+        self.random = random.Random()
+        setattr(self, "__lang__", locale)
+
+    def get_providers(self):
+        return [self]
+
+    def beta(self):
+        return getattr(self, "__lang__")
+
+    def shared(self):
+        return getattr(self, "__lang__")
+
+
+def custom_record_fake(locales, weights=None):
+    fake = Faker(list(locales))
+    alpha_locales, beta_locales = locales
+    fake._factory_map = OrderedDict(
+        [
+            (alpha_locales, AlphaRecordFactory(alpha_locales)),
+            (beta_locales, BetaRecordFactory(beta_locales)),
+        ]
+    )
+    fake._locales = list(locales)
+    fake._factories = list(fake._factory_map.values())
+    fake._weights = weights
+    return fake
+
+
 class TestFakerProxyClass:
     """Test Faker proxy class"""
 
@@ -429,6 +474,7 @@ class TestFakerProxyClass:
                 "_weights",
                 "_unique_proxy",
                 "_optional_proxy",
+                "_record_scopes",
             ]
         )
         for factory in fake.factories:
@@ -517,3 +563,157 @@ class TestFakerProxyClass:
         fake = Faker()
         pickled = pickle.dumps(fake)
         pickle.loads(pickled)
+
+
+class TestFakerRecordScope:
+    def test_record_scope_uses_weighted_eligible_factory_once(self):
+        fake = custom_record_fake(("de_DE", "ja_JP"), weights=[3, 2])
+        de_factory = fake._factory_map["de_DE"]
+        ja_factory = fake._factory_map["ja_JP"]
+
+        with patch("faker.proxy.choices_distribution", return_value=[de_factory]) as mock_dist:
+            with fake.record(["shared"]) as record:
+                assert record.locale == "de_DE"
+                assert record.shared() == "de_DE"
+                assert fake.shared() == "de_DE"
+                assert mock_dist.call_count == 1
+
+        with patch("faker.proxy.choices_distribution", return_value=[ja_factory]) as mock_dist:
+            with fake.record(["shared"]) as record:
+                assert record.locale == "ja_JP"
+                assert record.shared() == "ja_JP"
+                assert fake.shared() == "ja_JP"
+                assert mock_dist.call_count == 1
+
+        args = mock_dist.call_args[0]
+        assert args[0] == [de_factory, ja_factory]
+        assert args[1] == [3, 2]
+
+    def test_record_scope_filters_by_custom_provider_coverage(self):
+        fake = custom_record_fake(("de_DE", "ja_JP"), weights=[3, 2])
+
+        with fake.record(["alpha"]) as record:
+            assert record.locale == "de_DE"
+            assert record.alpha() == "de_DE"
+            assert record.shared() == "de_DE"
+            with pytest.raises(AttributeError, match="does not provide 'beta'"):
+                record.beta()
+
+        with fake.record(["beta"]) as record:
+            assert record.locale == "ja_JP"
+            assert record.beta() == "ja_JP"
+            assert record.shared() == "ja_JP"
+            with pytest.raises(AttributeError, match="does not provide 'alpha'"):
+                record.alpha()
+
+    def test_record_scope_uses_unweighted_eligible_factory(self):
+        fake = custom_record_fake(("de_DE", "ja_JP"))
+
+        with patch.object(random.Random, "choice", return_value=fake._factory_map["ja_JP"]) as mock_choice:
+            with fake.record(["shared"]) as record:
+                assert record.locale == "ja_JP"
+                assert record.shared() == "ja_JP"
+            mock_choice.assert_called_once_with(fake.factories)
+
+    def test_record_scope_reports_missing_required_providers(self):
+        fake = custom_record_fake(("de_DE", "ja_JP"), weights=[3, 2])
+
+        with pytest.raises(AttributeError) as exc_info:
+            with fake.record(["alpha", "beta"]):
+                pass
+
+        message = str(exc_info.value)
+        assert "de_DE is missing beta" in message
+        assert "ja_JP is missing alpha" in message
+        assert fake._record_scopes == []
+
+    def test_record_scope_reports_unsupported_method_after_entry(self):
+        fake = Faker(["en_US", "fr_FR", "en_PH"])
+
+        with fake.record(["luzon_province"]) as record:
+            with pytest.raises(AttributeError, match="does not provide 'name'"):
+                record.name()
+
+    def test_record_scope_accepts_explicit_hyphenated_locale(self):
+        fake = custom_record_fake(("de_DE", "ja_JP"))
+
+        with fake.record(provider_names=["shared"], locale="ja-JP") as record:
+            assert record.locale == "ja_JP"
+            assert record.shared() == "ja_JP"
+
+        with pytest.raises(AttributeError, match="Invalid configuration for record locale `fr_FR`"):
+            fake.record(locale="fr_FR")
+
+    def test_record_scope_restores_method_selection_after_exit_and_exception(self):
+        fake = Faker(["en_US", "fr_FR", "en_PH"])
+
+        with patch.object(Faker, "_select_factory", return_value=fake["en_PH"]) as mock_select:
+            with fake.record(locale="en_PH"):
+                assert fake._record_scopes[-1].locale == "en_PH"
+                assert fake.luzon_province()
+            mock_select.assert_not_called()
+
+            assert fake._record_scopes == []
+            fake.luzon_province()
+            mock_select.assert_called_once_with("luzon_province")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with fake.record(locale="fr_FR"):
+                raise RuntimeError("boom")
+
+        assert fake._record_scopes == []
+
+    def test_nested_record_scopes_restore_outer_record(self):
+        fake = Faker(["en_US", "fr_FR", "en_PH"])
+
+        with fake.record(locale="fr_FR") as outer:
+            assert outer.locale == "fr_FR"
+            assert fake.name()
+
+            with outer.record(locale="en_PH") as inner:
+                assert inner.locale == "en_PH"
+                assert inner.luzon_province()
+                assert fake.luzon_province()
+                with pytest.raises(AttributeError, match="does not provide 'name'"):
+                    inner.name()
+
+            assert fake._record_scopes[-1] is outer
+            assert fake.name()
+            with pytest.raises(AttributeError, match="does not provide 'luzon_province'"):
+                fake.luzon_province()
+
+        assert fake._record_scopes == []
+
+    def test_nested_record_scope_exception_restores_outer_record(self):
+        fake = Faker(["en_US", "fr_FR", "en_PH"])
+
+        with fake.record(locale="fr_FR") as outer:
+            with pytest.raises(ValueError, match="inner failure"):
+                with outer.record(locale="en_PH"):
+                    raise ValueError("inner failure")
+
+            assert fake._record_scopes[-1] is outer
+            assert fake.name()
+
+    def test_record_scope_rejects_fallback_locale_but_outside_keeps_old_behavior(self):
+        fake = Faker(["en"])
+
+        with patch("faker.proxy.Factory") as mock_factory:
+            outside_address = fake.address()
+            mock_factory.assert_not_called()
+
+        assert outside_address
+
+        with fake.record(locale="en") as record:
+            with pytest.raises(AttributeError, match="Record locale 'en' does not provide 'address'"):
+                record.address()
+
+        with fake.record(required_providers=["faker.providers.file"]) as record:
+            assert record.file_name()
+
+    def test_record_scope_unique_and_optional_keep_selected_locale(self):
+        fake = Faker(["en_US", "fr_FR"])
+
+        with fake.record(locale="fr_FR"):
+            assert fake.unique.name()
+            assert fake.optional.name(prob=1.0)
