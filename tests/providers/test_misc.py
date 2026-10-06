@@ -807,3 +807,242 @@ class TestMiscProvider:
     def test_sha256(self, faker):
         assert isinstance(faker.sha256(), str)
         assert isinstance(faker.sha256(raw_output=True), bytes)
+
+
+class TestStateTrajectory:
+    """Tests for the finite-state trajectory generator"""
+
+    order_transitions = {
+        "created": {"paid": 1.0},
+        "paid": {"shipped": 1.0},
+        "shipped": {"completed": 1.0},
+    }
+
+    # Exactly two complete paths reach "d" from "a" in two steps:
+    #   a -> b -> d with probability 0.5 * 0.25 = 0.125
+    #   a -> c -> d with probability 0.5 * 1.0  = 0.5
+    # The remaining probability mass (a -> b -> x, 0.375) never reaches an
+    # allowed end state, so the distribution conditioned on ending at "d" is
+    # 0.2 / 0.8 -- and not the 0.5 / 0.5 that step-by-step pruning of
+    # unsuitable edges would produce.
+    two_path_transitions = {
+        "a": {"b": 1.0, "c": 1.0},
+        "b": {"d": 1.0, "x": 3.0},
+        "c": {"d": 1.0},
+    }
+    two_path_expected = {
+        ("a", "b", "d"): 0.2,
+        ("a", "c", "d"): 0.8,
+    }
+
+    # Self-loop at "s"; "e" has no outgoing edges and is therefore absorbing.
+    # Paths of exactly three steps ending at "e":
+    #   s -> s -> t -> e with probability 0.5 * 0.5 * 1.0 = 0.25
+    #   s -> t -> e -> e with probability 0.5 * 1.0 * 1.0 = 0.5
+    # Conditioned on ending at "e": 1/3 and 2/3.
+    cyclic_transitions = {
+        "s": {"s": 1.0, "t": 1.0},
+        "t": {"e": 1.0},
+    }
+    cyclic_expected = {
+        ("s", "s", "t", "e"): 1.0 / 3.0,
+        ("s", "t", "e", "e"): 2.0 / 3.0,
+    }
+
+    @staticmethod
+    def _path_frequencies(fake, transitions, start, end_states, steps, samples=4000, **kwargs):
+        counts = {}
+        for _ in range(samples):
+            events = fake.state_trajectory(
+                transitions=transitions,
+                start=start,
+                end_states=end_states,
+                steps=steps,
+                **kwargs,
+            )
+            path = tuple(event.state for event in events)
+            counts[path] = counts.get(path, 0) + 1
+        return {path: count / samples for path, count in counts.items()}
+
+    def test_linear_trajectory(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        events = fake.state_trajectory(
+            transitions=self.order_transitions,
+            start="created",
+            end_states={"completed"},
+            steps=3,
+        )
+        assert [event.state for event in events] == ["created", "paid", "shipped", "completed"]
+        assert [event.timestamp for event in events] == [None, None, None, None]
+
+    def test_conditioned_distribution_two_paths(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        frequencies = self._path_frequencies(fake, self.two_path_transitions, "a", {"d"}, 2)
+        assert set(frequencies) == set(self.two_path_expected)
+        for path, probability in self.two_path_expected.items():
+            assert abs(frequencies[path] - probability) < 0.03
+
+    def test_conditioned_distribution_with_cycle(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        frequencies = self._path_frequencies(fake, self.cyclic_transitions, "s", {"e"}, 3)
+        assert set(frequencies) == set(self.cyclic_expected)
+        for path, probability in self.cyclic_expected.items():
+            assert abs(frequencies[path] - probability) < 0.03
+
+    def test_duration_sampler_does_not_change_path_distribution(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        # The sampler draws from the same random stream as the path sampler,
+        # yet the conditional path distribution must be preserved.
+        frequencies = self._path_frequencies(
+            fake,
+            self.two_path_transitions,
+            "a",
+            {"d"},
+            2,
+            duration_sampler=lambda: fake.random.uniform(0.0, 1.0),
+        )
+        assert set(frequencies) == set(self.two_path_expected)
+        for path, probability in self.two_path_expected.items():
+            assert abs(frequencies[path] - probability) < 0.03
+
+    def test_duration_sampler_produces_cumulative_timestamps(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        events = fake.state_trajectory(
+            transitions=self.order_transitions,
+            start="created",
+            end_states={"completed"},
+            steps=3,
+            duration_sampler=lambda: 1.5,
+        )
+        assert [event.timestamp for event in events] == [0.0, 1.5, 3.0, 4.5]
+
+    def test_negative_duration_rejected(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        with pytest.raises(ValueError):
+            fake.state_trajectory(
+                transitions=self.order_transitions,
+                start="created",
+                end_states={"completed"},
+                steps=3,
+                duration_sampler=lambda: -0.5,
+            )
+
+    def test_unreachable_end_state_fails_early(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        sampler_calls = []
+
+        def sampler():
+            sampler_calls.append(1)
+            return 1.0
+
+        # "z" is not connected to "a" at all.
+        with pytest.raises(exceptions.UnreachableStateError):
+            fake.state_trajectory(
+                transitions={"a": {"b": 1.0}},
+                start="a",
+                end_states={"z"},
+                steps=5,
+                duration_sampler=sampler,
+            )
+        # Failure happens before any sampling takes place.
+        assert sampler_calls == []
+
+    def test_end_state_unreachable_within_steps(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        # "completed" is three transitions away, so one step is not enough.
+        with pytest.raises(exceptions.UnreachableStateError):
+            fake.state_trajectory(
+                transitions=self.order_transitions,
+                start="created",
+                end_states={"completed"},
+                steps=1,
+            )
+
+    def test_zero_weight_edges_are_never_taken(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        transitions = {
+            "a": {"b": 0.0, "c": 1.0},
+            "c": {"d": 1.0},
+        }
+        for _ in range(100):
+            events = fake.state_trajectory(transitions=transitions, start="a", end_states={"d"}, steps=2)
+            assert [event.state for event in events] == ["a", "c", "d"]
+
+    def test_state_with_only_zero_weight_edges_is_absorbing(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        transitions = {"a": {"b": 0.0}}
+        events = fake.state_trajectory(transitions=transitions, start="a", end_states={"a"}, steps=3)
+        assert [event.state for event in events] == ["a", "a", "a", "a"]
+        with pytest.raises(exceptions.UnreachableStateError):
+            fake.state_trajectory(transitions=transitions, start="a", end_states={"b"}, steps=1)
+
+    def test_explicit_self_loop_absorbing_state(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        events = fake.state_trajectory(
+            transitions={"a": {"a": 2.0}},
+            start="a",
+            end_states={"a"},
+            steps=4,
+        )
+        assert [event.state for event in events] == ["a"] * 5
+
+    def test_zero_steps(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        events = fake.state_trajectory(
+            transitions=self.order_transitions,
+            start="created",
+            end_states={"created"},
+            steps=0,
+        )
+        assert [event.state for event in events] == ["created"]
+        with pytest.raises(exceptions.UnreachableStateError):
+            fake.state_trajectory(
+                transitions=self.order_transitions,
+                start="created",
+                end_states={"completed"},
+                steps=0,
+            )
+
+    def test_seedability(self):
+        fake = Faker()
+        fake.seed_instance(1234)
+        expected = [
+            fake.state_trajectory(transitions=self.cyclic_transitions, start="s", end_states={"e"}, steps=3)
+            for _ in range(10)
+        ]
+        fake.seed_instance(1234)
+        actual = [
+            fake.state_trajectory(transitions=self.cyclic_transitions, start="s", end_states={"e"}, steps=3)
+            for _ in range(10)
+        ]
+        assert actual == expected
+
+    def test_invalid_arguments(self):
+        fake = Faker()
+        fake.seed_instance(0)
+        with pytest.raises(ValueError):
+            fake.state_trajectory(transitions=self.order_transitions, start="created", end_states=set(), steps=3)
+        with pytest.raises(ValueError):
+            fake.state_trajectory(
+                transitions=self.order_transitions, start="created", end_states={"completed"}, steps=-1
+            )
+        with pytest.raises(ValueError):
+            fake.state_trajectory(
+                transitions={"a": {"b": -1.0}}, start="a", end_states={"b"}, steps=1
+            )
+        with pytest.raises(TypeError):
+            fake.state_trajectory(
+                transitions={"a": {"b": "heavy"}}, start="a", end_states={"b"}, steps=1
+            )

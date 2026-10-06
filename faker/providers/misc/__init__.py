@@ -10,9 +10,25 @@ import uuid
 import zipfile
 
 from json import JSONEncoder
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple, Type, Union, overload
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Dict,
+    Hashable,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    Union,
+    overload,
+)
 
-from faker.exceptions import UnsupportedFeature
+from faker.exceptions import UnreachableStateError, UnsupportedFeature
 
 from .. import BaseProvider
 from ..python import TypesSpec
@@ -31,6 +47,18 @@ DataColumns = List[ColumnSpec]
 _MAX_UNIX_TIME_S = 2051222400
 _MAX_UNIX_TIME_MS = _MAX_UNIX_TIME_S * 1_000
 _MAX_UNIX_TIME_NS = _MAX_UNIX_TIME_S * 1_000_000_000
+
+
+class TrajectoryEvent(NamedTuple):
+    """A single event of a generated state trajectory.
+
+    ``state`` is the state entered at this point of the trajectory and
+    ``timestamp`` is the elapsed time since the start of the trajectory, or
+    ``None`` when no duration sampler was supplied.
+    """
+
+    state: Hashable
+    timestamp: Optional[float]
 
 
 class Provider(BaseProvider):
@@ -878,6 +906,124 @@ class Provider(BaseProvider):
 
             data.append("".join(row))
         return "\n".join(data)
+
+    def state_trajectory(
+        self,
+        transitions: Dict[Hashable, Dict[Hashable, float]],
+        start: Hashable,
+        end_states: Collection[Hashable],
+        steps: int,
+        duration_sampler: Optional[Callable[[], float]] = None,
+    ) -> List[TrajectoryEvent]:
+        """Generate a finite-state trajectory of exactly ``steps`` transitions.
+
+        ``transitions`` maps each state to a mapping of successor states to
+        non-negative transition weights. Within each state, successors are
+        drawn with probability proportional to their weight, so the model is
+        a weighted Markov chain. Edges with zero weight are never taken. A
+        state without any positive-weight outgoing edge (including states
+        that only appear as targets or end states) is treated as an
+        absorbing state with an implicit self-loop, and self-loops may also
+        be declared explicitly, so cycles are supported.
+
+        The returned trajectory starts at ``start``, performs exactly
+        ``steps`` transitions, and is guaranteed to end in one of
+        ``end_states``. The state path follows the distribution of the
+        original transition model conditioned on ending in an allowed end
+        state after exactly ``steps`` transitions; unsuitable edges are not
+        simply dropped step by step. If no trajectory of the requested
+        length can reach an allowed end state, ``UnreachableStateError`` is
+        raised before any sampling takes place.
+
+        If ``duration_sampler`` is provided, it is called once per
+        transition and must return a non-negative number; the returned
+        events then carry cumulative timestamps. Duration draws never
+        influence the conditional probability of the state path. Without a
+        sampler, event timestamps are ``None``.
+
+        The result is a list of ``TrajectoryEvent`` named tuples of length
+        ``steps + 1``, starting with the start state.
+
+        :sample: transitions={"created": {"paid": 1.0}, "paid": {"shipped": 1.0},
+                "shipped": {"completed": 1.0}}, start="created", end_states={"completed"}, steps=3
+        :sample: transitions={"created": {"paid": 3.0, "cancelled": 1.0}, "paid": {"shipped": 1.0},
+                "cancelled": {"created": 1.0}, "shipped": {"completed": 1.0}},
+                start="created", end_states={"completed"}, steps=4
+        """
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            raise ValueError("The steps parameter must be a non-negative integer.")
+        end_set = set(end_states)
+        if not end_set:
+            raise ValueError("The end_states parameter must contain at least one state.")
+        if not isinstance(transitions, dict):
+            raise TypeError("The transitions parameter must be a dictionary.")
+
+        # Materialize the transition model over all known states. Zero-weight
+        # edges are dropped, and states without positive-weight outgoing edges
+        # become absorbing states via an implicit self-loop.
+        all_states: Set[Hashable] = {start} | end_set
+        for state, edges in transitions.items():
+            if not isinstance(edges, dict):
+                raise TypeError("Each transition table entry must be a dictionary of successor weights.")
+            all_states.add(state)
+            all_states.update(edges)
+
+        adjacency: Dict[Hashable, Dict[Hashable, float]] = {}
+        for state in all_states:
+            row: Dict[Hashable, float] = {}
+            for target, weight in (transitions.get(state) or {}).items():
+                if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+                    raise TypeError("Transition weights must be numbers.")
+                if not weight >= 0:
+                    raise ValueError("Transition weights must be non-negative.")
+                if weight > 0:
+                    row[target] = float(weight)
+            adjacency[state] = row if row else {state: 1.0}
+
+        # reach[k][state] is the probability, under the original transition
+        # model, of being in an allowed end state exactly k transitions after
+        # ``state``. Computed backwards before any sampling so that
+        # impossible requests fail early.
+        reach: List[Dict[Hashable, float]] = [{state: float(state in end_set) for state in all_states}]
+        for _ in range(steps):
+            previous = reach[-1]
+            level: Dict[Hashable, float] = {}
+            for state in all_states:
+                row = adjacency[state]
+                total_weight = sum(row.values())
+                level[state] = sum(weight / total_weight * previous[target] for target, weight in row.items())
+            reach.append(level)
+
+        if reach[steps][start] <= 0.0:
+            raise UnreachableStateError(
+                f"No trajectory of {steps} transitions from {start!r} can reach any of the allowed end states."
+            )
+
+        # Forward sampling: at each state, pick the successor with probability
+        # proportional to its transition weight times the probability of still
+        # reaching an allowed end state in the remaining steps. This yields
+        # exactly the original model's distribution conditioned on the end
+        # state, and every visited state has a positive total weight.
+        random = self.generator.random
+        first_timestamp = 0.0 if duration_sampler is not None else None
+        events: List[TrajectoryEvent] = [TrajectoryEvent(state=start, timestamp=first_timestamp)]
+        state = start
+        timestamp = 0.0
+        for remaining in range(steps, 0, -1):
+            row = adjacency[state]
+            previous = reach[remaining - 1]
+            targets = list(row)
+            weights = [row[target] * previous[target] for target in targets]
+            state = random.choices(targets, weights=weights, k=1)[0]
+            if duration_sampler is not None:
+                duration = duration_sampler()
+                if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not duration >= 0:
+                    raise ValueError("The duration_sampler callable must return a non-negative number.")
+                timestamp += duration
+                events.append(TrajectoryEvent(state=state, timestamp=timestamp))
+            else:
+                events.append(TrajectoryEvent(state=state, timestamp=None))
+        return events
 
     def _value_format_selection(self, definition: str, **kwargs: Any) -> Union[int, str]:
         """

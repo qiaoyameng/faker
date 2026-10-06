@@ -72,6 +72,19 @@ class Documentor:
                         "min_file_size": 512,
                     }
                 )
+            elif name == "state_trajectory":
+                faker_kwargs.update(
+                    {
+                        "transitions": {
+                            "created": {"paid": 1.0},
+                            "paid": {"shipped": 1.0},
+                            "shipped": {"completed": 1.0},
+                        },
+                        "start": "created",
+                        "end_states": {"completed"},
+                        "steps": 3,
+                    }
+                )
 
             if name == "enum":
                 faker_args = [FakerEnum]

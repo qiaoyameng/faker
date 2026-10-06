@@ -14,3 +14,8 @@ class UnsupportedFeature(BaseFakerException):
     def __init__(self, msg: str, name: str) -> None:
         self.name = name
         super().__init__(msg)
+
+
+class UnreachableStateError(BaseFakerException):
+    """No trajectory of the requested length can reach an allowed end state
+    from the start state under the given transition model."""
