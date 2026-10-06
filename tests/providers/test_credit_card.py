@@ -1,6 +1,9 @@
 import re
-
+from collections import Counter
+from itertools import product
 from typing import Pattern
+
+import pytest
 
 from faker.providers.bank.ru_RU import Provider as RuRuBankProvider
 from faker.providers.bank.uk_UA import Provider as UkUaBankProvider
@@ -81,6 +84,106 @@ class TestCreditCardProvider:
                 number = provider._generate_number(prefix, 15)
                 assert len(number) == 15
                 assert self.jcb_pattern.fullmatch(number)
+
+    def test_credit_card_number_from_mask_matches_exhaustive_set(self, faker):
+        digit_sets = [0, 0, "27", range(10), range(10), {0}]
+        expected = {
+            number
+            for number in (
+                "".join(digits)
+                for digits in product("0", "0", "27", "0123456789", "0123456789", "0")
+            )
+            if self.luhn_is_valid(number)
+        }
+
+        assert faker.credit_card_number_count(digit_sets) == len(expected)
+        assert faker.credit_card_number_mask_count(digit_sets) == len(expected)
+        assert faker.credit_card_number_mask_count("####") == 1000
+
+        faker.seed_instance(1234)
+        generated = {
+            faker.credit_card_number_from_mask(digit_sets)
+            for _ in range(500)
+        }
+
+        assert generated == expected
+        for number in generated:
+            assert number.startswith("00")
+            assert number.endswith("0")
+            assert number[2] in "27"
+
+    def test_credit_card_number_from_mask_uniformly_samples_valid_numbers(self, faker):
+        digit_sets = ["12", "27", range(10), range(10)]
+        expected = {
+            "".join(digits)
+            for digits in product("12", "27", "0123456789", "0123456789")
+            if self.luhn_is_valid("".join(digits))
+        }
+
+        assert faker.credit_card_number_count(digit_sets) == len(expected)
+        faker.seed_instance(1234)
+        counts = Counter(
+            faker.credit_card_number_from_digit_sets(digit_sets)
+            for _ in range(4000)
+        )
+
+        assert set(counts) == expected
+        assert all(self.luhn_is_valid(number) for number in counts)
+        assert min(counts.values()) > 75
+        assert max(counts.values()) < 125
+
+    def test_credit_card_number_from_mask_respects_fixed_check_digit(self, faker):
+        valid_mask = ["12", "27", range(10), range(10), "0"]
+        invalid_mask = ["1", "2", "3"]
+
+        for _ in range(20):
+            number = faker.credit_card_number_from_mask(valid_mask)
+            assert number.endswith("0")
+            assert self.luhn_is_valid(number)
+
+        assert faker.credit_card_number_count(valid_mask) > 0
+        assert faker.credit_card_number_count(invalid_mask) == 0
+        with pytest.raises(ValueError, match="No credit card numbers"):
+            faker.credit_card_number_from_mask(invalid_mask)
+
+    def test_credit_card_number_from_mask_counts_long_mask_without_enumeration(self, faker):
+        digit_sets = [0, 0, "27", *[range(10) for _ in range(996)], {0}]
+
+        assert faker.credit_card_number_count(digit_sets) == 2 * 10**995
+
+        faker.seed_instance(1234)
+        number = faker.credit_card_number_from_mask(digit_sets)
+
+        assert len(number) == 1000
+        assert number.startswith("00")
+        assert number.endswith("0")
+        assert number[2] in "27"
+        assert self.luhn_is_valid(number)
+
+    @pytest.mark.parametrize(
+        "digit_sets",
+        [
+            [],
+            [range(10), []],
+            [range(10), (10,)],
+            [range(10), "a"],
+        ],
+    )
+    def test_credit_card_number_from_mask_rejects_invalid_masks(self, faker, digit_sets):
+        with pytest.raises((TypeError, ValueError)):
+            faker.credit_card_number_count(digit_sets)
+
+    @staticmethod
+    def luhn_is_valid(number: str) -> bool:
+        total = 0
+        for index, digit in enumerate(reversed(number)):
+            value = int(digit)
+            if index % 2 == 1:
+                value *= 2
+                if value > 9:
+                    value -= 9
+            total += value
+        return total % 10 == 0
 
 
 class TestPtPt:

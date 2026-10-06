@@ -982,6 +982,31 @@ class Faker:
         """
         ...
 
+    def credit_card_number_count(
+        self,
+        mask: Union[str, Sequence[Union[str, int, Collection[Union[str, int]]]]] = ...,
+    ) -> int: ...
+
+    def credit_card_number_from_mask(
+        self,
+        mask: Union[str, Sequence[Union[str, int, Collection[Union[str, int]]]]] = ...,
+    ) -> str: ...
+
+    def credit_card_number_from_digit_sets(
+        self,
+        digit_sets: Sequence[Union[str, int, Collection[Union[str, int]]]] = ...,
+    ) -> str: ...
+
+    def credit_card_number_mask_count(
+        self,
+        mask: Union[str, Sequence[Union[str, int, Collection[Union[str, int]]]]] = ...,
+    ) -> int: ...
+
+    def credit_card_number_with_digit_sets(
+        self,
+        digit_sets: Sequence[Union[str, int, Collection[Union[str, int]]]] = ...,
+    ) -> str: ...
+
     def credit_card_provider(self, card_type: Optional[CardType] = ...) -> str:
         """
         Generate a credit card provider name.

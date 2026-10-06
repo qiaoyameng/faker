@@ -1,10 +1,89 @@
 from collections import OrderedDict
-from typing import Dict, List, Optional
+from collections.abc import Iterable as IterableABC
+from typing import Collection, Dict, List, Optional, Sequence, Union
 
 from ...typing import CardType, CreditCard, DateParseType
 from .. import BaseProvider
 
 localized = True
+
+DigitMask = Sequence[Union[str, int, Collection[Union[str, int]]]]
+LUHN_DIGIT_VALUES = (
+    tuple(range(10)),
+    (0, 2, 4, 6, 8, 1, 3, 5, 7, 9),
+)
+
+
+def _normalize_digit_mask(mask: Union[str, DigitMask]) -> List[tuple[int, ...]]:
+    if isinstance(mask, bytes | bytearray):
+        raise TypeError("The credit card mask must be a string or sequence.")
+
+    if isinstance(mask, str):
+        positions: IterableABC = mask
+    elif isinstance(mask, Sequence):
+        positions = mask
+    else:
+        raise TypeError("The credit card mask must be a string or sequence.")
+
+    digit_sets: List[tuple[int, ...]] = []
+    for position, allowed in enumerate(positions):
+        digits: set[int] = set()
+
+        def add_digit(value: Union[str, int]) -> None:
+            if isinstance(value, bool):
+                raise ValueError(f"Position {position} contains an invalid digit.")
+            if isinstance(value, int):
+                digit = value
+            elif isinstance(value, str) and len(value) == 1 and value in "0123456789":
+                digit = int(value)
+            else:
+                raise ValueError(f"Position {position} contains an invalid digit.")
+
+            if not 0 <= digit <= 9:
+                raise ValueError(f"Position {position} contains an invalid digit.")
+            digits.add(digit)
+
+        if isinstance(allowed, bool):
+            raise ValueError(f"Position {position} contains an invalid digit.")
+        if isinstance(allowed, int):
+            add_digit(allowed)
+        elif isinstance(allowed, str):
+            for char in allowed:
+                if char == "#":
+                    digits.update(range(10))
+                else:
+                    add_digit(char)
+        elif isinstance(allowed, IterableABC) and not isinstance(allowed, dict | bytes | bytearray):
+            for value in allowed:
+                add_digit(value)
+        else:
+            raise ValueError(f"Position {position} contains an invalid digit set.")
+
+        if not digits:
+            raise ValueError(f"Position {position} must allow at least one digit.")
+        digit_sets.append(tuple(sorted(digits)))
+
+    if not digit_sets:
+        raise ValueError("The credit card mask must contain at least one position.")
+    return digit_sets
+
+
+def _luhn_suffix_counts(digit_sets: Sequence[tuple[int, ...]]) -> List[List[int]]:
+    suffix_counts: List[List[int]] = [[0] * 10 for _ in range(len(digit_sets) + 1)]
+    suffix_counts[-1][0] = 1
+
+    for position in range(len(digit_sets) - 1, -1, -1):
+        weight_index = 0 if (len(digit_sets) - 1 - position) % 2 == 0 else 1
+        next_counts = suffix_counts[position + 1]
+        current_counts = suffix_counts[position]
+
+        for needed in range(10):
+            current_counts[needed] = sum(
+                next_counts[(needed - LUHN_DIGIT_VALUES[weight_index][digit]) % 10]
+                for digit in digit_sets[position]
+            )
+
+    return suffix_counts
 
 
 class Provider(BaseProvider):
@@ -121,6 +200,66 @@ class Provider(BaseProvider):
         prefix: str = self.random_element(card.prefixes)
         number = self._generate_number(self.numerify(prefix), card.length)
         return number
+
+    def credit_card_number_from_mask(self, mask: Union[str, DigitMask] = "#" * 16) -> str:
+        """Generate a valid credit card number matching the per-digit mask.
+
+        A string position accepts those exact digits, ``#`` allows any digit,
+        and any iterable position may contain integers or one-character digit
+        strings. Each complete valid number has equal probability.
+        """
+        digit_sets = _normalize_digit_mask(mask)
+        suffix_counts = _luhn_suffix_counts(digit_sets)
+        total = suffix_counts[0][0]
+
+        if total == 0:
+            raise ValueError("No credit card numbers satisfy the supplied mask.")
+
+        number = []
+        needed = 0
+        remaining = total
+
+        for position, allowed_digits in enumerate(digit_sets):
+            weight_index = 0 if (len(digit_sets) - 1 - position) % 2 == 0 else 1
+            digit_values = LUHN_DIGIT_VALUES[weight_index]
+            weights = [
+                suffix_counts[position + 1][(needed - digit_values[digit]) % 10]
+                for digit in allowed_digits
+            ]
+
+            choice = self.generator.random.randrange(remaining)
+            cumulative = 0
+            selected = allowed_digits[0]
+            next_needed = 0
+
+            for digit, branch_weight in zip(allowed_digits, weights):
+                cumulative += branch_weight
+                if choice < cumulative:
+                    selected = digit
+                    next_needed = (needed - digit_values[digit]) % 10
+                    break
+
+            number.append(str(selected))
+            needed = next_needed
+            remaining = suffix_counts[position + 1][needed]
+
+        return "".join(number)
+
+    def credit_card_number_with_digit_sets(self, digit_sets: DigitMask = ("#",) * 16) -> str:
+        """Generate a valid number from a sequence of per-digit digit sets."""
+        return self.credit_card_number_from_mask(digit_sets)
+
+    def credit_card_number_from_digit_sets(self, digit_sets: DigitMask = ("#",) * 16) -> str:
+        """Generate a valid number from a sequence of per-digit digit sets."""
+        return self.credit_card_number_from_mask(digit_sets)
+
+    def credit_card_number_count(self, mask: Union[str, DigitMask] = "#" * 16) -> int:
+        """Return the number of Luhn-valid numbers allowed by the mask."""
+        return _luhn_suffix_counts(_normalize_digit_mask(mask))[0][0]
+
+    def credit_card_number_mask_count(self, mask: Union[str, DigitMask] = "#" * 16) -> int:
+        """Return the number of Luhn-valid numbers allowed by the mask."""
+        return self.credit_card_number_count(mask)
 
     def credit_card_expire(
         self,
