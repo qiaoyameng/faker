@@ -3,6 +3,7 @@ import re
 
 from typing import TYPE_CHECKING, Any, Callable, Dict, Hashable, List, Optional, Type, Union
 
+from .quota import JointCounts, QuotaRecordIterator, dual_quota_records
 from .typing import SeedType
 
 if TYPE_CHECKING:
@@ -86,6 +87,72 @@ class Generator:
         This is a secure way to make a fake from another Provider.
         """
         return self.get_formatter(formatter)(*args, **kwargs)
+
+    def dual_quota_records(
+        self,
+        row_quotas: dict[Hashable, int],
+        column_quotas: dict[Hashable, int],
+        forbidden: Any | None = (),
+        *,
+        row_key: str = "row",
+        column_key: str = "column",
+        fields: dict[str, Any] | None = None,
+    ) -> tuple[JointCounts, QuotaRecordIterator]:
+        """
+        Generate exact two-category quota records using this random source.
+
+        Marginal quotas are checked with a max-flow feasibility calculation before
+        iteration begins. The returned joint counts are deterministic for the supplied
+        mappings and forbidden pairs; the iterator is reproducible when this generator
+        is seeded, but is not promised to be uniform over all feasible joint tables.
+        """
+        return dual_quota_records(
+            self,
+            row_quotas,
+            column_quotas,
+            forbidden,
+            row_key=row_key,
+            column_key=column_key,
+            fields=fields,
+        )
+
+    def quota_records(
+        self,
+        row_quotas: dict[Hashable, int],
+        column_quotas: dict[Hashable, int],
+        forbidden: Any | None = (),
+        *,
+        row_key: str = "row",
+        column_key: str = "column",
+        fields: dict[str, Any] | None = None,
+    ) -> tuple[JointCounts, QuotaRecordIterator]:
+        return self.dual_quota_records(
+            row_quotas,
+            column_quotas,
+            forbidden,
+            row_key=row_key,
+            column_key=column_key,
+            fields=fields,
+        )
+
+    def joint_quota_records(
+        self,
+        row_quotas: dict[Hashable, int],
+        column_quotas: dict[Hashable, int],
+        forbidden: Any | None = (),
+        *,
+        row_key: str = "row",
+        column_key: str = "column",
+        fields: dict[str, Any] | None = None,
+    ) -> tuple[JointCounts, QuotaRecordIterator]:
+        return self.dual_quota_records(
+            row_quotas,
+            column_quotas,
+            forbidden,
+            row_key=row_key,
+            column_key=column_key,
+            fields=fields,
+        )
 
     def get_formatter(self, formatter: str) -> Callable:
         try:

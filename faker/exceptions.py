@@ -14,3 +14,11 @@ class UnsupportedFeature(BaseFakerException):
     def __init__(self, msg: str, name: str) -> None:
         self.name = name
         super().__init__(msg)
+
+
+class InfeasibleQuotaException(BaseFakerException):
+    """The two quota sets cannot be satisfied under the forbidden combinations."""
+
+    def __init__(self, msg: str, certificate: dict | None = None) -> None:
+        self.certificate = certificate or {}
+        super().__init__(msg)
