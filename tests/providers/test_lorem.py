@@ -1,7 +1,9 @@
 import re
+import unicodedata
 
 import pytest
 
+from faker.exceptions import ImpossibleTextLength, TextGenerationBudgetExceeded
 from faker.providers.lorem.az_AZ import Provider as AzAzLoremProvider
 from faker.providers.lorem.bn_BD import Provider as BnBdLoremProvider
 from faker.providers.lorem.cs_CZ import Provider as CsCzLoremProvider
@@ -849,6 +851,68 @@ class TestLoremProvider:
                 assert len(text) <= num_chars
                 words = re.sub(r"[.\n]+", " ", text.lower()).split()
                 assert all(word in self.custom_word_list for word in words)
+
+    def test_text_bytes_with_mixed_english_and_chinese(self, faker):
+        text = faker.text_bytes(["a", "中"], target_nb_bytes=5)
+
+        assert text == "a 中"
+        assert len(text.encode("utf-8")) == 5
+
+    def test_text_bytes_with_default_arguments(self, faker):
+        text = faker.text_bytes()
+
+        assert len(text.encode("utf-8")) == 16
+        assert unicodedata.is_normalized("NFC", text)
+
+    def test_text_bytes_with_combining_character_boundary(self, faker):
+        text = faker.text_bytes(["e", "中"], target_nb_bytes=5, separator="\u0301")
+
+        assert text == "é中"
+        assert len(text.encode("utf-8")) == 5
+
+    def test_text_bytes_deduplicates_equivalent_normalized_fragments(self, faker):
+        text = faker.text_bytes(["é", "e\u0301"], target_nb_bytes=2)
+
+        assert text == "é"
+        assert len(text.encode("utf-8")) == 2
+
+    def test_text_bytes_repeats_fragments_without_splitting_them(self, faker):
+        text = faker.text_bytes(["ab"], target_nb_bytes=8)
+
+        assert text == "ab ab ab"
+        assert len(text.split(" ")) == 3
+
+    def test_text_bytes_uses_requested_normalization(self, faker):
+        text = faker.text_bytes(["é"], target_nb_bytes=3, normalization="NFD")
+
+        assert text == "e\u0301"
+        assert len(text.encode("utf-8")) == 3
+
+    def test_text_bytes_uses_compatibility_normalization(self, faker):
+        text = faker.text_bytes(["ﬁ"], target_nb_bytes=5, normalization="NFKC", separator="-")
+
+        assert text == "fi-fi"
+        assert len(text.encode("utf-8")) == 5
+
+    def test_text_bytes_rejects_invalid_normalization(self, faker):
+        with pytest.raises(ValueError, match="normalization"):
+            faker.text_bytes(["a"], target_nb_bytes=1, normalization="INVALID")
+
+    def test_text_bytes_rejects_empty_normalized_fragments(self, faker):
+        with pytest.raises(ValueError, match="fragments"):
+            faker.text_bytes([""], target_nb_bytes=1)
+
+    def test_text_bytes_rejects_empty_normalized_separator(self, faker):
+        with pytest.raises(ValueError, match="separator"):
+            faker.text_bytes(["a"], target_nb_bytes=1, separator="")
+
+    def test_text_bytes_reports_mathematical_impossibility(self, faker):
+        with pytest.raises(ImpossibleTextLength, match="exactly 4 UTF-8 bytes"):
+            faker.text_bytes(["a", "中"], target_nb_bytes=4)
+
+    def test_text_bytes_reports_exhausted_budget_separately(self, faker):
+        with pytest.raises(TextGenerationBudgetExceeded, match="Search budget of 1"):
+            faker.text_bytes(["a"], target_nb_bytes=101, separator="-", budget=1)
 
     def test_get_default_words_list(self, faker):
         words_list = faker.get_words_list()

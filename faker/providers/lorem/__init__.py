@@ -1,5 +1,8 @@
-from typing import List, Optional, Sequence, cast
+from collections import deque
+from typing import Collection, Deque, Dict, List, Optional, Sequence, Set, Tuple, cast
+from unicodedata import normalize
 
+from ...exceptions import ImpossibleTextLength, TextGenerationBudgetExceeded
 from .. import BaseProvider
 
 localized = True
@@ -22,6 +25,86 @@ class Provider(BaseProvider):
 
     word_connector = " "
     sentence_punctuation = "."
+
+    @staticmethod
+    def _normalize_text(value: str, normalization: str) -> str:
+        try:
+            return normalize(normalization, value)
+        except (LookupError, TypeError) as exc:
+            raise ValueError(f"Unsupported Unicode normalization form: {normalization}") from exc
+
+    @staticmethod
+    def _normalized_pieces(
+        fragments: Collection[str],
+        separator: str,
+        normalization: str,
+    ) -> Tuple[List[str], str]:
+        if not isinstance(separator, str):
+            raise TypeError("separator must be a string")
+
+        normalized_separator = Provider._normalize_text(separator, normalization)
+        if not normalized_separator:
+            raise ValueError("separator must contain at least one character after normalization")
+
+        normalized_fragments_by_value: Dict[str, str] = {}
+        for fragment in fragments:
+            if not isinstance(fragment, str):
+                raise TypeError("fragments must be strings")
+
+            normalized_fragment = Provider._normalize_text(fragment, normalization)
+            if not normalized_fragment:
+                raise ValueError("fragments must contain at least one character after normalization")
+
+            normalized_fragments_by_value.setdefault(normalized_fragment, normalized_fragment)
+
+        if not normalized_fragments_by_value:
+            raise ValueError("at least one fragment is required")
+
+        return list(normalized_fragments_by_value), normalized_separator
+
+    def _find_exact_byte_text(
+        self,
+        fragments: List[str],
+        separator: str,
+        target_nb_bytes: int,
+        normalization: str,
+        budget: int,
+    ) -> str:
+        queue: Deque[str] = deque()
+        seen: Set[str] = set()
+        attempts = 0
+
+        queue.append("")
+        seen.add("")
+
+        while queue:
+            current = queue.popleft()
+            suffixes = list(fragments) if not current else [separator + fragment for fragment in fragments]
+            self.generator.random.shuffle(suffixes)
+
+            for suffix in suffixes:
+                attempts += 1
+                if attempts > budget:
+                    raise TextGenerationBudgetExceeded(
+                        f"Search budget of {budget} transitions was exhausted before an exact "
+                        f"{target_nb_bytes}-byte text was found or proven impossible."
+                    )
+
+                candidate = self._normalize_text(current + suffix, normalization)
+                candidate_bytes = len(candidate.encode("utf-8"))
+
+                if candidate_bytes > target_nb_bytes or candidate in seen:
+                    continue
+                if candidate_bytes == target_nb_bytes:
+                    return candidate
+
+                seen.add(candidate)
+                queue.append(candidate)
+
+        raise ImpossibleTextLength(
+            f"No combination of the supplied fragments has exactly {target_nb_bytes} UTF-8 bytes "
+            f"after {normalization} normalization."
+        )
 
     def get_words_list(
         self,
@@ -261,6 +344,52 @@ class Provider(BaseProvider):
                 text.pop()
 
         return "".join(text)
+
+    def text_bytes(
+        self,
+        fragments: Optional[Collection[str]] = None,
+        target_nb_bytes: int = 16,
+        normalization: str = "NFC",
+        separator: str = " ",
+        budget: int = 10000,
+    ) -> str:
+        """Generate text with an exact normalized UTF-8 byte length.
+
+        When ``fragments`` is ``None``, a small built-in set of fragments is
+        used.
+
+        Fragments may be repeated. Fragments that are equal after
+        normalization are treated as a single candidate. Fragments and
+        separators are never truncated, and padding is not added.
+
+        :sample: fragments=['hello', 'world'], target_nb_bytes=11
+        :sample: fragments=['a', '中'], target_nb_bytes=5
+        :sample: fragments=['e', 'x'], target_nb_bytes=5, separator='\u0301'
+        """
+        if type(target_nb_bytes) is not int:
+            raise TypeError("target_nb_bytes must be an integer")
+        if type(budget) is not int:
+            raise TypeError("budget must be an integer")
+        if target_nb_bytes <= 0:
+            raise ValueError("target_nb_bytes must be greater than 0")
+        if budget <= 0:
+            raise ValueError("budget must be greater than 0")
+        if fragments is None:
+            fragments = ["lorem", "ipsum", "dolor", "sit", "amet"]
+
+        normalized_fragments, normalized_separator = self._normalized_pieces(
+            fragments,
+            separator,
+            normalization,
+        )
+
+        return self._find_exact_byte_text(
+            normalized_fragments,
+            normalized_separator,
+            target_nb_bytes,
+            normalization,
+            budget,
+        )
 
     def texts(
         self, nb_texts: int = 3, max_nb_chars: int = 200, ext_word_list: Optional[Sequence[str]] = None

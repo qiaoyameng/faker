@@ -2017,6 +2017,30 @@ class Faker:
         """
         ...
 
+    def text_bytes(
+        self,
+        fragments: Optional[Collection[str]] = ...,
+        target_nb_bytes: int = ...,
+        normalization: str = ...,
+        separator: str = ...,
+        budget: int = ...,
+    ) -> str:
+        """
+        Generate text with an exact normalized UTF-8 byte length.
+
+        When ``fragments`` is ``None``, a small built-in set of fragments is
+        used.
+
+        Fragments may be repeated. Fragments that are equal after
+        normalization are treated as a single candidate. Fragments and
+        separators are never truncated, and padding is not added.
+
+        :sample: fragments=['hello', 'world'], target_nb_bytes=11
+        :sample: fragments=['a', '中'], target_nb_bytes=5
+        :sample: fragments=['e', 'x'], target_nb_bytes=5, separator='\u0301'
+        """
+        ...
+
     def texts(
         self, nb_texts: int = ..., max_nb_chars: int = ..., ext_word_list: Optional[Sequence[str]] = ...
     ) -> List[str]:
