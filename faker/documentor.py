@@ -76,6 +76,16 @@ class Documentor:
             if name == "enum":
                 faker_args = [FakerEnum]
 
+            if name == "gaussian_copula":
+                from .providers.copula import lognormal_marginal, normal_marginal
+
+                faker_kwargs.update(
+                    {
+                        "correlation": [[1.0, 0.5], [0.5, 1.0]],
+                        "marginals": [normal_marginal(), lognormal_marginal()],
+                    }
+                )
+
             if with_args:
                 # retrieve all parameter
                 argspec = inspect.getfullargspec(method)
