@@ -209,6 +209,22 @@ class Faker:
         """
         ...
 
+    def finite_state_trajectory(
+        self,
+        transitions: Any = ...,
+        start_state: Any = ...,
+        end_states: Any = ...,
+        steps: Any = ...,
+        duration_sampler: Optional[Callable[[], Any]] = ...,
+        **kwargs: Any,
+    ) -> list:
+        """Generate a weighted state trajectory with an exact length and terminal state."""
+        ...
+
+    random_trajectory = finite_state_trajectory
+    state_trajectory = finite_state_trajectory
+    trajectory = finite_state_trajectory
+
     def random_choices(
         self, elements: Union[Collection[T], OrderedDict[T, float]] = ..., length: Optional[int] = ...
     ) -> Sequence[T]:

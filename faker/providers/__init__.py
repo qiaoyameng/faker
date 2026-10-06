@@ -1,8 +1,25 @@
 import re
 import string
 
+from math import isfinite
+
 from collections import OrderedDict
-from typing import Any, Collection, List, Optional, Sequence, TypeVar, Union
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Dict,
+    Generic,
+    Hashable,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 from ..generator import Generator
 from ..typing import OrderedDictType
@@ -17,7 +34,59 @@ _re_qm = re.compile(r"\?")
 _re_cir = re.compile(r"\^")
 
 T = TypeVar("T")
+TState = TypeVar("TState", bound=Hashable)
 ElementsType = Union[Collection[T], OrderedDictType[T, float]]
+TrajectoryTransitionsType = Union[
+    Mapping[
+        TState,
+        Union[
+            Mapping[TState, float],
+            Sequence[Union[Tuple[TState, TState], Tuple[TState, TState, float]]],
+        ],
+    ],
+    Sequence[Tuple[TState, TState]],
+    Sequence[Tuple[TState, TState, float]],
+]
+
+_TRAJECTORY_MISSING = object()
+
+
+class TrajectoryEvent(NamedTuple, Generic[TState]):
+    state: TState
+    duration: Any
+    time: Any
+
+    @property
+    def elapsed(self) -> Any:
+        return self.time
+
+    @property
+    def timestamp(self) -> Any:
+        return self.time
+
+
+class Trajectory(list, Generic[TState]):
+    def __init__(
+        self,
+        states: Sequence[TState],
+        events: Sequence[TrajectoryEvent[TState]],
+    ) -> None:
+        super().__init__(states)
+        self.states = list(states)
+        self.path = list(states)
+        self.events = list(events)
+
+    @property
+    def durations(self) -> List[float]:
+        return [event.duration for event in self.events]
+
+    @property
+    def times(self) -> List[float]:
+        return [event.time for event in self.events]
+
+    @property
+    def timestamps(self) -> List[float]:
+        return self.times
 
 
 class BaseProvider:
@@ -566,6 +635,172 @@ class BaseProvider:
         :sample: elements=('a', 'b', 'c', 'd', 'e', 'f'), length=3
         """
         return self.random_elements(elements, length, unique=True)
+
+    def random_trajectory(
+        self,
+        transitions: Any = _TRAJECTORY_MISSING,
+        start_state: Any = _TRAJECTORY_MISSING,
+        end_states: Any = _TRAJECTORY_MISSING,
+        steps: Any = _TRAJECTORY_MISSING,
+        duration_sampler: Optional[Callable[[], Any]] = None,
+        **kwargs: Any,
+    ) -> Trajectory[TState]:
+        """Generate a weighted state trajectory with an exact length and terminal state.
+
+        ``transitions`` is either an adjacency mapping such as
+        ``{"created": {"paid": 2, "cancelled": 1}}`` or a sequence of
+        ``(source, destination)`` / ``(source, destination, weight)`` edges.
+        Generated paths have exactly ``steps`` transitions and finish in one of
+        ``end_states``. Paths are sampled from the original transition model
+        conditioned on that terminal constraint: each edge weight is multiplied
+        by the total weight of paths that can still reach an allowed terminal
+        state in the remaining number of transitions.
+
+        If ``duration_sampler`` is supplied, it is called once per transition
+        after the state path has been selected. Returned durations must be
+        non-negative and are accumulated in ``Trajectory.events``; they cannot
+        affect the probability of the state path.
+
+        :sample: transitions={"a": {"b": 1}}, start_state="a", end_states="b", steps=1
+        """
+        if transitions is _TRAJECTORY_MISSING:
+            raise ValueError("random_trajectory() missing required argument: 'transitions'")
+        required_arguments = {
+            "start_state": start_state,
+            "end_states": end_states,
+            "steps": steps,
+        }
+        missing = [name for name, value in required_arguments.items() if value is _TRAJECTORY_MISSING]
+        if missing:
+            raise ValueError(f"random_trajectory() missing required argument: {missing[0]!r}")
+        if kwargs:
+            name = sorted(kwargs)[0]
+            raise TypeError(f"random_trajectory() got an unexpected keyword argument {name!r}")
+        if duration_sampler is not None and not callable(duration_sampler):
+            raise TypeError("duration_sampler must be callable.")
+
+        graph = self._normalize_trajectory_transitions(transitions)
+        if isinstance(end_states, (tuple, list, set, frozenset)):
+            allowed_ends = set(end_states)
+        else:
+            allowed_ends = {end_states}
+
+        if not allowed_ends:
+            raise ValueError("end_states must contain at least one state.")
+        if not isinstance(steps, int) or isinstance(steps, bool) or steps < 0:
+            raise ValueError("steps must be a non-negative integer.")
+
+        reachable: List[Dict[Any, float]] = [{state: 1.0 for state in allowed_ends}]
+        for remaining in range(1, steps + 1):
+            paths_to_end: Dict[Any, float] = {}
+            for source, edges in graph.items():
+                total_weight = 0.0
+                for destination, weight in edges.items():
+                    total_weight += weight * reachable[remaining - 1].get(destination, 0.0)
+                if total_weight > 0.0:
+                    paths_to_end[source] = total_weight
+            reachable.append(paths_to_end)
+
+        if reachable[steps].get(start_state, 0.0) <= 0.0:
+            raise ValueError("No trajectory reaches an allowed end state in the specified number of steps.")
+
+        states = [start_state]
+        state = start_state
+        for remaining in range(steps, 0, -1):
+            candidates = []
+            conditional_weights = []
+            for destination, weight in graph.get(state, {}).items():
+                future_weight = reachable[remaining - 1].get(destination, 0.0)
+                conditional_weight = weight * future_weight
+                candidates.append(destination)
+                conditional_weights.append(conditional_weight)
+
+            state = choices_distribution(
+                candidates,
+                conditional_weights,
+                self.generator.random,
+                length=1,
+            )[0]
+            states.append(state)
+
+        durations = []
+        if duration_sampler is not None:
+            for _ in range(steps):
+                duration = duration_sampler()
+                if not duration >= 0:
+                    raise ValueError("duration_sampler must return non-negative durations.")
+                durations.append(duration)
+
+        events = []
+        current_time = 0
+        events.append(TrajectoryEvent(states[0], current_time, current_time))
+        for index, state in enumerate(states[1:], start=1):
+            duration = durations[index - 1] if durations else 0
+            current_time += duration
+            events.append(TrajectoryEvent(state, duration, current_time))
+
+        return Trajectory(states, events)
+
+    def _normalize_trajectory_transitions(
+        self,
+        transitions: TrajectoryTransitionsType[TState],
+    ) -> Dict[Any, Dict[Any, float]]:
+        graph: Dict[Any, Dict[Any, float]] = {}
+
+        if isinstance(transitions, Mapping):
+            for source, edges in transitions.items():
+                graph.setdefault(source, {})
+                if isinstance(edges, Mapping):
+                    normalized_edges = edges.items()
+                elif isinstance(edges, Sequence) and not isinstance(edges, (str, bytes, bytearray)):
+                    normalized_edges = []
+                    for edge in edges:
+                        if isinstance(edge, tuple) and len(edge) == 2:
+                            normalized_edges.append(edge)
+                            continue
+                        if not isinstance(edge, (tuple, list)):
+                            normalized_edges.append((edge, 1.0))
+                            continue
+                        raise ValueError(
+                            "Adjacency sequences must contain destinations or (destination, weight) tuples."
+                        )
+                else:
+                    raise ValueError(
+                        "Transition mappings must map each state to a mapping or sequence of destination states."
+                    )
+                for destination, weight in normalized_edges:
+                    self._validate_trajectory_weight(weight)
+                    graph.setdefault(destination, {})
+                    graph[source][destination] = graph[source].get(destination, 0.0) + weight
+            return graph
+
+        if isinstance(transitions, Sequence) and not isinstance(transitions, (str, bytes, bytearray)):
+            for edge in transitions:
+                if not isinstance(edge, tuple) or len(edge) not in (2, 3):
+                    raise ValueError(
+                        "Transition sequences must contain (source, destination) or "
+                        "(source, destination, weight) tuples."
+                    )
+                source, destination = edge[0], edge[1]
+                weight = edge[2] if len(edge) == 3 else 1.0
+                self._validate_trajectory_weight(weight)
+                graph.setdefault(source, {})
+                graph.setdefault(destination, {})
+                graph[source][destination] = graph[source].get(destination, 0.0) + weight
+            return graph
+
+        raise ValueError("transitions must be a mapping or a sequence of transition tuples.")
+
+    @staticmethod
+    def _validate_trajectory_weight(weight: Any) -> None:
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+            raise ValueError("Transition weights must be finite, non-negative numbers.")
+        if not isfinite(weight) or weight < 0:
+            raise ValueError("Transition weights must be finite, non-negative numbers.")
+
+    finite_state_trajectory = random_trajectory
+    state_trajectory = random_trajectory
+    trajectory = random_trajectory
 
     def randomize_nb_elements(
         self,
