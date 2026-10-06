@@ -2035,6 +2035,52 @@ class Faker:
         """
         ...
 
+    def text_with_exact_byte_length(
+        self,
+        fragments: Sequence[str],
+        separator: str = ...,
+        *,
+        nb_bytes: int,
+        unicode_form: str = ...,
+        max_operations: int = ...,
+    ) -> str:
+        """
+        Generate a string whose normalized UTF-8 encoding has an exact size.
+
+        Unlike |text|, whose ``max_nb_chars`` is an upper bound measured in
+        characters, this method targets an exact number of UTF-8 bytes
+        *after* Unicode normalization. The result is a concatenation of
+        fragments from ``fragments`` (fragments may repeat) joined by
+        ``separator``. No fragment is ever truncated or split, and the size
+        is never padded with extra spaces: if the target cannot be hit with
+        the supplied pieces, an exception is raised instead.
+
+        ``fragments`` must be a non-empty sequence. Fragments and the
+        separator are normalized with ``unicode_form`` (one of ``NFC``,
+        ``NFD``, ``NFKC``, ``NFKD``); fragments that are equal after
+        normalization are treated as the same candidate, and a fragment that
+        becomes empty after normalization is rejected, since it would create
+        a zero-length loop. The separator must likewise be non-empty *after*
+        normalization: an empty separator scheme would allow joins to grow
+        the piece count without consuming any bytes. ``nb_bytes`` must be
+        positive.
+
+        Bytes are counted on the normalized whole string, which matters when
+        combining characters meet across a join boundary, e.g. a fragment
+        ending in a base letter followed by a separator or fragment starting
+        with a combining mark: NFC composes the pair into one code point.
+
+        If no combination of the fragments can ever total ``nb_bytes``,
+        |UnsatisfiableByteLength| is raised. If the exhaustive search needs
+        more than ``max_operations`` normalizations to decide,
+        |ByteLengthBudgetExhausted| is raised instead; that means the answer
+        is unknown, not that no solution exists.
+
+        :sample: fragments=['hello', '你好', '世界'], nb_bytes=12
+        :sample: fragments=['b', 'e'], separator='\\u0300', nb_bytes=3
+        """
+        ...
+
     def word(self, part_of_speech: Optional[str] = ..., ext_word_list: Optional[Sequence[str]] = ...) -> str:
         """
         Generate a word.

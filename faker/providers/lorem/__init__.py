@@ -1,11 +1,53 @@
-from typing import List, Optional, Sequence, cast
+import unicodedata
+from collections import deque
+from typing import Deque, Dict, List, Optional, Sequence, Tuple, cast
 
+from ...exceptions import BaseFakerException
 from .. import BaseProvider
 
 localized = True
 
 # 'Latin' is the default locale
 default_locale = "la"
+
+
+class ExactByteLengthException(BaseFakerException):
+    """Base class for errors raised by |text_with_exact_byte_length|."""
+
+
+class UnsatisfiableByteLength(ExactByteLengthException):
+    """No sequence of the supplied fragments reaches the requested byte size.
+
+    This is a mathematical impossibility for the given fragment/separator
+    combination, not a resource problem: the search enumerated every byte
+    size that can be produced and none of them equals the target.
+    """
+
+
+class ByteLengthBudgetExhausted(ExactByteLengthException):
+    """The operation budget ran out before the search could finish.
+
+    Distinct from |UnsatisfiableByteLength|: the answer is unknown here,
+    because the search space was not fully explored.
+    """
+
+
+_NORMALIZATION_FORMS = ("NFC", "NFD", "NFKC", "NFKD")
+
+
+def _interactive_tail(normalized_text: str) -> str:
+    """Return the suffix of an already-normalized string that can interact
+    with text appended to it during a later normalization.
+
+    Canonical reordering and composition can never cross a character with
+    canonical combining class 0 (a "starter"), so everything from the last
+    starter on is all the context an appended string may need. A string
+    without starters can interact as a whole.
+    """
+    for index in range(len(normalized_text) - 1, -1, -1):
+        if unicodedata.combining(normalized_text[index]) == 0:
+            return normalized_text[index:]
+    return normalized_text
 
 
 class Provider(BaseProvider):
@@ -278,3 +320,164 @@ class Provider(BaseProvider):
                  ext_word_list=['abc', 'def', 'ghi', 'jkl']
         """
         return [self.text(max_nb_chars, ext_word_list) for _ in range(0, nb_texts)]
+
+    def text_with_exact_byte_length(
+        self,
+        fragments: Sequence[str],
+        separator: str = " ",
+        *,
+        nb_bytes: int,
+        unicode_form: str = "NFC",
+        max_operations: int = 1_000_000,
+    ) -> str:
+        """Generate a string whose normalized UTF-8 encoding has an exact size.
+
+        Unlike |text|, whose ``max_nb_chars`` is an upper bound measured in
+        characters, this method targets an exact number of UTF-8 bytes
+        *after* Unicode normalization. The result is a concatenation of
+        fragments from ``fragments`` (fragments may repeat) joined by
+        ``separator``. No fragment is ever truncated or split, and the size
+        is never padded with extra spaces: if the target cannot be hit with
+        the supplied pieces, an exception is raised instead.
+
+        ``fragments`` must be a non-empty sequence. Fragments and the
+        separator are normalized with ``unicode_form`` (one of ``NFC``,
+        ``NFD``, ``NFKC``, ``NFKD``); fragments that are equal after
+        normalization are treated as the same candidate, and a fragment that
+        becomes empty after normalization is rejected, since it would create
+        a zero-length loop. The separator must likewise be non-empty *after*
+        normalization: an empty separator scheme would allow joins to grow
+        the piece count without consuming any bytes. ``nb_bytes`` must be
+        positive.
+
+        Bytes are counted on the normalized whole string, which matters when
+        combining characters meet across a join boundary, e.g. a fragment
+        ending in a base letter followed by a separator or fragment starting
+        with a combining mark: NFC composes the pair into one code point.
+
+        If no combination of the fragments can ever total ``nb_bytes``,
+        |UnsatisfiableByteLength| is raised. If the exhaustive search needs
+        more than ``max_operations`` normalizations to decide,
+        |ByteLengthBudgetExhausted| is raised instead; that means the answer
+        is unknown, not that no solution exists.
+
+        :sample: fragments=['hello', '你好', '世界'], nb_bytes=12
+        :sample: fragments=['b', 'e'], separator='\\u0300', nb_bytes=3
+        """
+        if isinstance(nb_bytes, bool) or not isinstance(nb_bytes, int):
+            raise TypeError("nb_bytes must be an integer")
+        if isinstance(max_operations, bool) or not isinstance(max_operations, int):
+            raise TypeError("max_operations must be an integer")
+        if nb_bytes <= 0:
+            raise ValueError("nb_bytes must be positive")
+        if max_operations <= 0:
+            raise ValueError("max_operations must be positive")
+        if unicode_form not in _NORMALIZATION_FORMS:
+            raise ValueError(f"unicode_form must be one of {', '.join(_NORMALIZATION_FORMS)}")
+        if not isinstance(separator, str):
+            raise TypeError("separator must be a string")
+        if not fragments:
+            raise ValueError("fragments must be a non-empty sequence")
+
+        remaining_operations = max_operations
+
+        def normalize(value: str) -> str:
+            nonlocal remaining_operations
+            remaining_operations -= 1
+            if remaining_operations < 0:
+                raise ByteLengthBudgetExhausted(
+                    f"used more than {max_operations} normalization operations while "
+                    f"searching for an exact {nb_bytes}-byte string; the answer is unknown"
+                )
+            return unicodedata.normalize(unicode_form, value)
+
+        normalized_separator = normalize(separator)
+        if not normalized_separator:
+            raise ValueError(
+                "separator is empty after normalization; an empty separator scheme "
+                "would allow zero-length joins"
+            )
+
+        # Fragments equal after normalization are one and the same value.
+        # The first original spelling is kept so the returned string is built
+        # from caller-provided pieces verbatim.
+        originals: Dict[str, str] = {}
+        for fragment in fragments:
+            if not isinstance(fragment, str):
+                raise TypeError("fragments must contain only strings")
+            normalized_fragment = normalize(fragment)
+            if not normalized_fragment:
+                raise ValueError(
+                    f"fragment {fragment!r} is empty after normalization; empty "
+                    "fragments would create zero-length loops"
+                )
+            originals.setdefault(normalized_fragment, fragment)
+        normalized_fragments: Tuple[str, ...] = tuple(originals)
+
+        # A state is (interactive tail, normalized size in bytes). The tail
+        # is the suffix starting at the last combining-class-0 character:
+        # normalization of an appended string can only interact with that
+        # suffix. The size belongs to the state too, since the same tail can
+        # occur at several sizes. A transition appends the separator (except
+        # at the root) and one fragment, then normalizes. Weights are byte
+        # deltas, always non-negative, so states are enumerated by size with
+        # zero-weight edges closed first through a bounded queue, which keeps
+        # zero-weight cycles finite. parent[state] records the previous state
+        # and the original spelling of the fragment used for the transition.
+        State = Tuple[str, int]
+        root: State = ("", 0)
+        parent: Dict[State, Tuple[State, str]] = {}
+        levels: Dict[int, Dict[State, None]] = {0: {root: None}}
+
+        size = 0
+        while size < nb_bytes:
+            current = levels.get(size)
+            if current is None:
+                size += 1
+                continue
+
+            queue: Deque[State] = deque(current)
+            while queue:
+                tail, state_size = queue.popleft()
+                prefix_part = tail + normalized_separator if tail else ""
+                for normalized_fragment in normalized_fragments:
+                    next_text = normalize(prefix_part + normalized_fragment)
+                    next_size = state_size + len(next_text.encode("utf-8")) - len(tail.encode("utf-8"))
+                    next_state = (_interactive_tail(next_text), next_size)
+                    if next_size == state_size and next_state not in parent:
+                        parent[next_state] = ((tail, state_size), originals[normalized_fragment])
+                        current[next_state] = None
+                        queue.append(next_state)
+
+            for tail, state_size in tuple(current):
+                prefix_part = tail + normalized_separator if tail else ""
+                for normalized_fragment in normalized_fragments:
+                    next_text = normalize(prefix_part + normalized_fragment)
+                    next_size = state_size + len(next_text.encode("utf-8")) - len(tail.encode("utf-8"))
+                    if next_size <= state_size or next_size > nb_bytes:
+                        continue
+                    next_state = (_interactive_tail(next_text), next_size)
+                    if next_state not in parent:
+                        parent[next_state] = ((tail, state_size), originals[normalized_fragment])
+                    levels.setdefault(next_size, {})[next_state] = None
+
+            size += 1
+
+        target_state = next(iter(levels.get(nb_bytes, ())), None)
+        if target_state is None:
+            raise UnsatisfiableByteLength(
+                f"no combination of the {len(normalized_fragments)} fragment(s) "
+                f"separated by {separator!r} can produce exactly {nb_bytes} "
+                f"bytes in {unicode_form}"
+            )
+
+        pieces: List[str] = []
+        node: State = target_state
+        while node != root:
+            previous, fragment = parent[node]
+            pieces.append(fragment)
+            node = previous
+        pieces.reverse()
+        result = separator.join(pieces)
+        assert len(unicodedata.normalize(unicode_form, result).encode("utf-8")) == nb_bytes
+        return result

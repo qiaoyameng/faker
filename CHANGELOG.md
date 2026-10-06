@@ -1,5 +1,9 @@
 ## Changelog
 
+### Unreleased
+
+* Add `text_with_exact_byte_length()` to the lorem provider: build text from a fixed set of fragments whose UTF-8 length after a chosen Unicode normalization (NFC/NFD/NFKC/NFKD) equals an exact byte target, with `UnsatisfiableByteLength` and `ByteLengthBudgetExhausted` distinguished.
+
 ### [v40.40.0 - 2026-09-28](https://github.com/joke2k/faker/compare/v40.39.0...v40.40.0)
 
 * Fix: generate valid CNP birth dates in `ro_RO` `ssn()` (#2431). Thanks @chuenchen309.

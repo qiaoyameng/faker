@@ -1,7 +1,10 @@
 import re
 
+import unicodedata
+
 import pytest
 
+from faker.providers.lorem import ByteLengthBudgetExhausted, UnsatisfiableByteLength
 from faker.providers.lorem.az_AZ import Provider as AzAzLoremProvider
 from faker.providers.lorem.bn_BD import Provider as BnBdLoremProvider
 from faker.providers.lorem.cs_CZ import Provider as CsCzLoremProvider
@@ -1104,3 +1107,147 @@ class TestViVn:
         for _ in range(num_samples):
             words = faker.words(num_words)
             assert all(isinstance(word, str) and word in ViVNLoremProvider.word_list for word in words)
+
+
+class TestTextWithExactByteLength:
+    """Tests for the exact-normalized-byte-length lorem entry point."""
+
+    @pytest.mark.parametrize("unicode_form", ["NFC", "NFD", "NFKC", "NFKD"])
+    @pytest.mark.parametrize("nb_bytes", [1, 2, 3, 7, 12, 25, 100, 1000])
+    def test_result_normalizes_to_exact_byte_length(self, faker, nb_bytes, unicode_form):
+        fragments = ["a", "bc", "hello", "世界"]
+        result = faker.text_with_exact_byte_length(
+            fragments, nb_bytes=nb_bytes, unicode_form=unicode_form
+        )
+        normalized = unicodedata.normalize(unicode_form, result)
+        assert len(normalized.encode("utf-8")) == nb_bytes
+        assert all(fragment in fragments for fragment in result.split(" "))
+
+    def test_mixed_chinese_and_english_example(self, faker):
+        # "hello" is 5 UTF-8 bytes, each Chinese character is 3 bytes:
+        # 5 + 1 (space) + 3 + 3 == 12.
+        result = faker.text_with_exact_byte_length(["hello", "你好", "世界"], nb_bytes=12)
+        assert result == "hello 你好"
+        assert len(unicodedata.normalize("NFC", result).encode("utf-8")) == 12
+
+    def test_combining_accent_across_join_boundary(self, faker):
+        # The combining grave separator joins "e" and composes across the
+        # boundary into U+00E8 (2 bytes); "b" then adds one more byte. A
+        # naive byte sum of the separately normalized pieces predicts 4
+        # bytes, but NFC of the whole string yields 3.
+        result = faker.text_with_exact_byte_length(["b", "e"], separator="\u0300", nb_bytes=3)
+        normalized = unicodedata.normalize("NFC", result)
+        assert normalized == "\u00e8b"
+        assert len(normalized.encode("utf-8")) == 3
+        assert len("e".encode()) + len("\u0300".encode()) + len("b".encode()) == 4
+
+    def test_impossible_length_is_reported_as_unsatisfiable(self, faker):
+        # Every join weighs 2k + (k - 1) bytes: 3, 6, 9, ..., so 4 is out.
+        with pytest.raises(UnsatisfiableByteLength):
+            faker.text_with_exact_byte_length(["aa"], separator="-", nb_bytes=4)
+
+    def test_budget_exhaustion_is_distinct_from_unsatisfiable(self, faker):
+        # The target is reachable ("a" repeated), but the tiny budget cannot
+        # prove it: this must be a budget error, not an impossibility.
+        with pytest.raises(ByteLengthBudgetExhausted):
+            faker.text_with_exact_byte_length(["a"], nb_bytes=100, max_operations=5)
+        # The same distinction holds when the answer happens to be "no
+        # solution": an interrupted search is still reported as unknown.
+        with pytest.raises(ByteLengthBudgetExhausted):
+            faker.text_with_exact_byte_length(["aa"], separator="-", nb_bytes=100, max_operations=5)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"fragments": [], "nb_bytes": 5},
+            {"fragments": [""], "nb_bytes": 5},
+            {"fragments": ["a", ""], "nb_bytes": 5},
+        ],
+    )
+    def test_empty_fragments_are_rejected(self, faker, kwargs):
+        with pytest.raises(ValueError):
+            faker.text_with_exact_byte_length(**kwargs)
+
+    @pytest.mark.parametrize(
+        "empty_value,target",
+        [("fragment", "x"), ("separator", "a")],
+    )
+    def test_value_that_normalizes_to_empty_is_rejected(self, faker, monkeypatch, empty_value, target):
+        # Simulate a piece whose normalization is empty (real examples depend
+        # on the Unicode database version): such pieces must be rejected up
+        # front to avoid zero-length loops.
+        import faker.providers.lorem as lorem_module
+
+        real_normalize = unicodedata.normalize
+        marker = "\ue000"
+
+        def fake_normalize(form, value):
+            if value == marker:
+                return ""
+            return real_normalize(form, value)
+
+        monkeypatch.setattr(lorem_module.unicodedata, "normalize", fake_normalize)
+        with pytest.raises(ValueError):
+            if empty_value == "fragment":
+                faker.text_with_exact_byte_length([marker, target], nb_bytes=10)
+            else:
+                faker.text_with_exact_byte_length([target], marker, nb_bytes=10)
+
+    def test_fragments_equivalent_after_normalization_are_deduplicated(self, faker):
+        # "e\u0301" and "\u00e9" are the same text after NFC, so this is a
+        # one-candidate alphabet: odd byte sizes (1, 3, ...) are impossible.
+        with pytest.raises(UnsatisfiableByteLength):
+            faker.text_with_exact_byte_length(["e\u0301", "\u00e9"], nb_bytes=3)
+        result = faker.text_with_exact_byte_length(["e\u0301", "\u00e9"], nb_bytes=5)
+        assert len(unicodedata.normalize("NFC", result).encode("utf-8")) == 5
+
+    @pytest.mark.parametrize(
+        "nb_bytes,kwargs",
+        [
+            (0, {}),
+            (-1, {}),
+            (5, {"max_operations": 0}),
+            (5, {"unicode_form": "nfc"}),
+        ],
+    )
+    def test_invalid_arguments_raise_value_error(self, faker, nb_bytes, kwargs):
+        with pytest.raises(ValueError):
+            faker.text_with_exact_byte_length(["a"], nb_bytes=nb_bytes, **kwargs)
+
+    def test_non_integer_sizes_raise_type_error(self, faker):
+        with pytest.raises(TypeError):
+            faker.text_with_exact_byte_length(["a"], nb_bytes=5.0)
+        with pytest.raises(TypeError):
+            faker.text_with_exact_byte_length(["a"], nb_bytes=5, max_operations=10.0)
+
+    def test_fragments_can_repeat(self, faker):
+        result = faker.text_with_exact_byte_length(["ab"], nb_bytes=5)
+        assert result == "ab ab"
+
+    def test_search_agrees_with_brute_force(self, faker):
+        import itertools
+
+        fragments = ["a", "e\u0300", "x"]
+        separator = "\u0300"
+        for unicode_form in ["NFC", "NFD", "NFKC", "NFKD"]:
+            reachable = set()
+            for length in range(1, 8):
+                for choice in itertools.product(range(len(fragments)), repeat=length):
+                    joined = separator.join(fragments[index] for index in choice)
+                    reachable.add(
+                        len(unicodedata.normalize(unicode_form, joined).encode("utf-8"))
+                    )
+            for nb_bytes in range(1, 12):
+                if nb_bytes in reachable:
+                    result = faker.text_with_exact_byte_length(
+                        fragments, separator, nb_bytes=nb_bytes, unicode_form=unicode_form
+                    )
+                    assert (
+                        len(unicodedata.normalize(unicode_form, result).encode("utf-8"))
+                        == nb_bytes
+                    )
+                else:
+                    with pytest.raises(UnsatisfiableByteLength):
+                        faker.text_with_exact_byte_length(
+                            fragments, separator, nb_bytes=nb_bytes, unicode_form=unicode_form
+                        )
