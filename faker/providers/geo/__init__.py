@@ -1,11 +1,14 @@
-from decimal import Decimal
-from typing import Optional, Tuple, Union
+import math
+from decimal import Decimal, ROUND_HALF_EVEN
+from typing import List, Optional, Tuple, Union
 
 from .. import BaseProvider
+from .region import GeoRegion, GeoRect, solid_angle
 
 localized = True
 
 PlaceType = Tuple[str, str, str, str, str]
+_WORLD_REGION = GeoRegion([GeoRect(-90, 90, -180, 180)])
 
 
 class Provider(BaseProvider):
@@ -1025,6 +1028,76 @@ class Provider(BaseProvider):
 
     def latlng(self) -> Tuple[Decimal, Decimal]:
         return (self.latitude(), self.longitude())
+
+    def latlng_in_region(self, region: Optional[GeoRegion] = None) -> Tuple[Decimal, Decimal]:
+        """
+        Generate one coordinate uniformly by spherical area inside a boolean
+        rectangle region.
+
+        :sample:
+        """
+
+        if region is None:
+            region = _WORLD_REGION
+
+        if region.is_empty:
+            raise ValueError("Cannot sample coordinates from an empty region")
+
+        weights = [solid_angle(cell) for cell in region.cells]
+        return self._sample_region_latlng(region, weights)
+
+    def latlngs_in_region(
+        self,
+        region: Optional[GeoRegion] = None,
+        count: int = 1,
+    ) -> List[Tuple[Decimal, Decimal]]:
+        """
+        Generate ``count`` coordinates uniformly by spherical area inside a
+        boolean rectangle region.
+
+        :sample: count=2
+        """
+
+        if count < 0:
+            raise ValueError("count cannot be negative")
+        if region is None:
+            region = _WORLD_REGION
+
+        if region.is_empty:
+            return []
+
+        weights = [solid_angle(cell) for cell in region.cells]
+        return [self._sample_region_latlng(region, weights) for _ in range(count)]
+
+    def region_latlng(
+        self,
+        region: Optional[GeoRegion] = None,
+        count: Optional[int] = None,
+    ) -> Union[Tuple[Decimal, Decimal], List[Tuple[Decimal, Decimal]]]:
+        """
+        Return one coordinate, or a list when ``count`` is provided.
+        """
+
+        if count is None:
+            return self.latlng_in_region(region)
+        return self.latlngs_in_region(region, count)
+
+    def _sample_region_latlng(self, region: GeoRegion, weights: List[float]) -> Tuple[Decimal, Decimal]:
+        random = self.generator.random
+
+        while True:
+            min_lat, max_lat, min_lon, max_lon = random.choices(region.cells, weights=weights)[0]
+            min_sin_lat = math.sin(math.radians(min_lat))
+            max_sin_lat = math.sin(math.radians(max_lat))
+            lat_value = math.degrees(math.asin(random.uniform(min_sin_lat, max_sin_lat)))
+            lon_value = random.uniform(min_lon, max_lon)
+            lat = Decimal(str(lat_value)).quantize(Decimal(".000001"), rounding=ROUND_HALF_EVEN)
+            lon = Decimal(str(lon_value)).quantize(Decimal(".000001"), rounding=ROUND_HALF_EVEN)
+            if lon == 0:
+                lon = Decimal("0.000000")
+
+            if region.contains(float(lat), float(lon)):
+                return lat, lon
 
     def local_latlng(
         self,

@@ -1,9 +1,12 @@
+import math
 import re
 import unittest
 
 from decimal import Decimal
 
 from faker import Faker
+from faker.providers.geo import GeoRect, GeoRegion
+from faker.providers.geo.region import EARTH_RADIUS_KM
 from faker.providers.geo.pt_PT import Provider as PtPtProvider
 
 
@@ -243,3 +246,138 @@ class TestMkMk(unittest.TestCase):
         for _ in range(100):
             lon = self.fake.local_longitude()
             assert 20.45 <= float(lon) <= 23.03, f"Longitude {lon} out of MK bounds"
+
+
+class TestGeoRegion(unittest.TestCase):
+    def setUp(self):
+        self.fake = Faker()
+        Faker.seed(123456)
+
+    def test_invalid_rectangles(self):
+        with self.assertRaises(ValueError):
+            GeoRect(-91, 0, 0, 1)
+        with self.assertRaises(ValueError):
+            GeoRect(0, 91, 0, 1)
+        with self.assertRaises(ValueError):
+            GeoRect(0, 1, -181, 0)
+        with self.assertRaises(ValueError):
+            GeoRect(0, 1, 0, 181)
+        with self.assertRaises(ValueError):
+            GeoRect(1, 0, 0, 1)
+        with self.assertRaises(TypeError):
+            GeoRegion([(0, 1, 0)])
+
+    def test_zero_area_region(self):
+        region = GeoRegion([GeoRect(0, 0, 0, 1)])
+        self.assertTrue(region.is_empty)
+        self.assertEqual(region.area_km2, 0)
+        self.assertEqual(self.fake.latlngs_in_region(region, 5), [])
+        with self.assertRaises(ValueError):
+            self.fake.latlng_in_region(region)
+
+    def test_entire_region_removed(self):
+        region = GeoRegion(
+            include=[GeoRect(10, 20, -180, 180)],
+            exclude=[GeoRect(10, 20, -180, 180)],
+        )
+        self.assertTrue(region.is_empty)
+        self.assertEqual(region.cells, ())
+        self.assertEqual(self.fake.region_latlng(region, count=3), [])
+        with self.assertRaises(ValueError):
+            self.fake.region_latlng(region)
+
+    def test_tuple_rectangles_and_default_region(self):
+        region = GeoRegion(include=[(-10, 10, -180, 180)])
+        self.assertEqual(region.include, (GeoRect(-10, 10, -180, 180),))
+
+        for _ in range(20):
+            lat, lon = self.fake.latlng_in_region()
+            self.assertTrue(-90 <= float(lat) <= 90)
+            self.assertTrue(-180 <= float(lon) <= 180)
+
+    def test_area_union_and_exclusion(self):
+        included = GeoRegion(
+            [
+                GeoRect(-10, 10, 0, 90),
+                GeoRect(-10, 10, 60, 120),
+            ]
+        )
+        expected_longitude = math.radians(120)
+        expected_latitude = math.sin(math.radians(10)) - math.sin(math.radians(-10))
+        self.assertAlmostEqual(included.solid_angle, expected_longitude * expected_latitude)
+
+        holed = GeoRegion(
+            include=[GeoRect(-10, 10, -180, 180)],
+            exclude=[GeoRect(-10, 10, 0, 180)],
+        )
+        expected_holed_longitude = math.radians(180)
+        self.assertAlmostEqual(holed.solid_angle, expected_holed_longitude * expected_latitude)
+
+    def test_antimeridian_rectangle(self):
+        region = GeoRegion([GeoRect(-10, 10, 170, -170)])
+        self.assertTrue(region.contains(0, 175))
+        self.assertTrue(region.contains(0, -175))
+        self.assertFalse(region.contains(0, 0))
+        self.assertAlmostEqual(
+            region.solid_angle,
+            math.radians(20)
+            * (math.sin(math.radians(10)) - math.sin(math.radians(-10))),
+        )
+
+        for _ in range(100):
+            lat, lon = self.fake.latlng_in_region(region)
+            self.assertTrue(-10 <= lat <= 10)
+            self.assertTrue(float(lon) >= 170 or float(lon) <= -170)
+
+    def test_pole_regions(self):
+        north = GeoRegion([GeoRect(80, 90, -180, 180)])
+        south = GeoRegion([GeoRect(-90, -80, -180, 180)])
+        expected = math.radians(360) * (1 - math.sin(math.radians(80)))
+        self.assertAlmostEqual(north.solid_angle, expected)
+        self.assertAlmostEqual(south.solid_angle, expected)
+        self.assertAlmostEqual(north.area_km2, expected * EARTH_RADIUS_KM**2)
+        self.assertTrue(north.contains(90, 0))
+        self.assertTrue(south.contains(-90, 180))
+
+        for _ in range(100):
+            lat, _ = self.fake.latlng_in_region(north)
+            self.assertTrue(80 <= float(lat) <= 90)
+
+    def test_region_samples_match_area_proportions(self):
+        equatorial = GeoRect(-10, 10, -180, 180)
+        high_latitude = GeoRect(60, 80, -180, 180)
+        crossing_with_hole = GeoRect(-30, -20, 170, -170)
+        hole = GeoRect(-30, -25, 175, -175)
+        region = GeoRegion(
+            include=[equatorial, high_latitude, crossing_with_hole],
+            exclude=[hole],
+        )
+
+        areas = {
+            "equatorial": GeoRegion([equatorial]).solid_angle,
+            "high_latitude": GeoRegion([high_latitude]).solid_angle,
+            "crossing": GeoRegion([crossing_with_hole], [hole]).solid_angle,
+        }
+        total_area = sum(areas.values())
+        self.assertAlmostEqual(region.solid_angle, total_area)
+
+        samples = self.fake.latlngs_in_region(region, 20000)
+        counts = {"equatorial": 0, "high_latitude": 0, "crossing": 0}
+        for lat, lon in samples:
+            self.assertTrue(region.contains(float(lat), float(lon)))
+            self.assertFalse(hole.contains(float(lat), float(lon)))
+            if -10 <= float(lat) <= 10:
+                counts["equatorial"] += 1
+            elif 60 <= float(lat) <= 80:
+                counts["high_latitude"] += 1
+            elif -30 <= float(lat) <= -20 and (float(lon) >= 170 or float(lon) <= -170):
+                counts["crossing"] += 1
+
+        self.assertEqual(sum(counts.values()), len(samples))
+        for name, area in areas.items():
+            with self.subTest(zone=name):
+                self.assertAlmostEqual(
+                    counts[name] / len(samples),
+                    area / total_area,
+                    delta=0.015,
+                )
