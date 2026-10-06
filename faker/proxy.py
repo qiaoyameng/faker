@@ -9,7 +9,7 @@ from random import Random
 from typing import Any, Callable, Pattern, Sequence, TypeVar
 
 from .config import DEFAULT_LOCALE
-from .exceptions import UniquenessException
+from .exceptions import NoSuitableLocaleError, UniquenessException
 from .factory import Factory
 from .generator import Generator
 from .typing import SeedType
@@ -37,6 +37,7 @@ class Faker:
         use_weighting: bool = True,
         **config: Any,
     ) -> None:
+        self._record_scope_stack: list[tuple[str, Generator | Faker]] = []
         self._factory_map: OrderedDict[str, Generator | Faker] = OrderedDict()
         self._weights = None
         self._unique_proxy = UniqueProxy(self)
@@ -126,6 +127,14 @@ class Faker:
         :param attr: attribute name
         :return: the appropriate attribute
         """
+        record_scope_stack = self.__dict__.get("_record_scope_stack")
+        if record_scope_stack:
+            locale, factory = record_scope_stack[-1]
+            try:
+                return getattr(factory, attr)
+            except AttributeError:
+                msg = f"Record scope locale {locale!r} does not support attribute {attr!r}"
+                raise AttributeError(msg) from None
         if len(self._factories) == 1:
             return getattr(self._factories[0], attr)
         elif attr in self.generator_attrs:
@@ -146,6 +155,7 @@ class Faker:
         result._factory_map = copy.deepcopy(self._factory_map, memodict)
         result._factories = list(result._factory_map.values())
         result._weights = copy.deepcopy(self._weights, memodict)
+        result._record_scope_stack = []
         result._unique_proxy = UniqueProxy(result)
         result._unique_proxy._seen = {k: {result._unique_proxy._sentinel} for k in self._unique_proxy._seen.keys()}
         result._optional_proxy = OptionalProxy(result)
@@ -296,6 +306,108 @@ class Faker:
 
     def items(self) -> list[tuple[str, Generator | Faker]]:
         return list(self._factory_map.items())
+
+    def record(
+        self,
+        locale: str | None = None,
+        providers: Sequence[str] | None = None,
+    ) -> RecordScope:
+        """
+        Creates a record scope pinning all attribute access to a single locale
+
+        On entry, one locale is selected (honoring locale weights) among the
+        locales whose factories support every provider named in ``providers``,
+        and every attribute resolved inside the scope is served by that
+        locale's factory. Attributes not supported by the selected locale
+        raise ``AttributeError`` instead of silently falling back to another
+        locale. Scopes may be nested, and the previous scope is restored when
+        the inner scope exits, even on error.
+
+        :param locale: optional locale string pinning the scope to that locale
+        :param providers: optional provider method names the selected locale must support
+        :return: a context manager managing the record scope
+        """
+        return RecordScope(self, locale=locale, providers=providers)
+
+    def _select_record_factory(
+        self,
+        locale: str | None,
+        providers: tuple[str, ...],
+    ) -> tuple[str, Generator | Faker]:
+        """
+        Selects the locale and factory to pin for a record scope
+
+        :param locale: optional locale string pinning the selection
+        :param providers: provider method names the selected factory must support
+        :return: 2-tuple (locale, factory)
+        """
+        if locale is not None:
+            normalized = locale.replace("-", "_")
+            if normalized not in self._factory_map:
+                msg = f"Locale {normalized!r} is not one of the configured locales {self.locales!r}"
+                raise NoSuitableLocaleError(msg)
+            factory = self._factory_map[normalized]
+            missing = [name for name in providers if not hasattr(factory, name)]
+            if missing:
+                msg = f"Locale {normalized!r} does not support required providers: {', '.join(missing)}"
+                raise NoSuitableLocaleError(msg)
+            return normalized, factory
+
+        candidates: list[tuple[str, Generator | Faker]] = []
+        weights: list[int | float] = []
+        for index, (code, factory) in enumerate(self._factory_map.items()):
+            if all(hasattr(factory, name) for name in providers):
+                candidates.append((code, factory))
+                if self._weights:
+                    weights.append(self._weights[index])
+
+        if not candidates:
+            details = "; ".join(
+                f"{code}: missing {', '.join(name for name in providers if not hasattr(factory, name)) or 'nothing'}"
+                for code, factory in self._factory_map.items()
+            )
+            msg = (
+                f"No locale supports all required providers: {', '.join(providers)}. "
+                f"Per-locale missing providers - {details}"
+            )
+            raise NoSuitableLocaleError(msg)
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        if self._weights:
+            selected = choices_distribution(
+                candidates,
+                weights,
+                self._factories[0].random,
+                length=1,
+            )[0]
+        else:
+            selected = self._factories[0].random.choice(candidates)
+        return selected
+
+
+class RecordScope:
+    """Context manager pinning a multi-locale ``Faker`` proxy to one locale per record"""
+
+    def __init__(
+        self,
+        proxy: Faker,
+        locale: str | None = None,
+        providers: Sequence[str] | None = None,
+    ) -> None:
+        self._proxy = proxy
+        self._locale = locale
+        self._providers = tuple(providers) if providers else ()
+
+    def __enter__(self) -> Faker:
+        selected = self._proxy._select_record_factory(self._locale, self._providers)
+        self._proxy._record_scope_stack.append(selected)
+        return self._proxy
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        self._proxy._record_scope_stack.pop()
+        return False
 
 
 class UniqueProxy:

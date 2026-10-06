@@ -9,7 +9,9 @@ import pytest
 
 from faker import Faker
 from faker.config import DEFAULT_LOCALE
+from faker.exceptions import NoSuitableLocaleError
 from faker.generator import Generator
+from faker.providers import BaseProvider
 
 
 class TestFakerProxyClass:
@@ -429,6 +431,7 @@ class TestFakerProxyClass:
                 "_weights",
                 "_unique_proxy",
                 "_optional_proxy",
+                "_record_scope_stack",
             ]
         )
         for factory in fake.factories:
@@ -517,3 +520,182 @@ class TestFakerProxyClass:
         fake = Faker()
         pickled = pickle.dumps(fake)
         pickle.loads(pickled)
+
+
+class RecordAlphaProvider(BaseProvider):
+    """Custom provider covering `record_token` and `alpha_only`"""
+
+    def record_token(self):
+        return "alpha-token"
+
+    def alpha_only(self):
+        return "alpha-only"
+
+
+class RecordBetaProvider(BaseProvider):
+    """Custom provider covering `record_token` and `beta_only`"""
+
+    def record_token(self):
+        return "beta-token"
+
+    def beta_only(self):
+        return "beta-only"
+
+
+class TestFakerRecordScope:
+    """Test record scopes of the Faker proxy class"""
+
+    @staticmethod
+    def _make_fake(locale=None):
+        if locale is None:
+            locale = OrderedDict([("en_US", 1), ("fr_FR", 1)])
+        fake = Faker(locale)
+        fake["en_US"].add_provider(RecordAlphaProvider)
+        fake["fr_FR"].add_provider(RecordBetaProvider)
+        return fake
+
+    def test_record_scope_pins_single_locale_for_whole_record(self):
+        fake = self._make_fake()
+        fake.seed_instance(1234)
+
+        with fake.record(providers=["record_token"]):
+            tokens = [fake.record_token() for _ in range(20)]
+
+        assert len(set(tokens)) == 1
+        assert tokens[0] in ("alpha-token", "beta-token")
+
+    def test_record_scope_required_providers_restrict_candidates(self):
+        fake = self._make_fake()
+        fake.seed_instance(1234)
+
+        for _ in range(10):
+            with fake.record(providers=["alpha_only"]):
+                assert fake.record_token() == "alpha-token"
+                assert fake.alpha_only() == "alpha-only"
+
+        for _ in range(10):
+            with fake.record(providers=["record_token", "beta_only"]):
+                assert fake.record_token() == "beta-token"
+                assert fake.beta_only() == "beta-only"
+
+    def test_record_scope_no_candidate_reports_missing_providers(self):
+        fake = self._make_fake()
+
+        with pytest.raises(NoSuitableLocaleError) as excinfo:
+            with fake.record(providers=["alpha_only", "beta_only"]):
+                pass
+
+        message = str(excinfo.value)
+        assert "alpha_only" in message and "beta_only" in message
+        assert "en_US" in message and "fr_FR" in message
+
+    def test_record_scope_unknown_provider_reports_all_locales_missing(self):
+        fake = self._make_fake()
+
+        with pytest.raises(NoSuitableLocaleError) as excinfo:
+            with fake.record(providers=["nonexistent_method"]):
+                pass
+
+        assert "nonexistent_method" in str(excinfo.value)
+
+    def test_record_scope_selection_uses_locale_weights(self):
+        fake = self._make_fake(locale=OrderedDict([("en_US", 4), ("ja_JP", 3), ("fr_FR", 1)]))
+
+        with patch("faker.proxy.choices_distribution", side_effect=lambda a, p, r, length: [a[0]]) as mock_dist:
+            with fake.record(providers=["record_token"]):
+                assert fake.record_token() == "alpha-token"
+
+        assert mock_dist.call_count == 1
+        candidates, weights = mock_dist.call_args[0][:2]
+        # ja_JP lacks `record_token`, so it and its weight are excluded
+        assert [locale for locale, _ in candidates] == ["en_US", "fr_FR"]
+        assert weights == [4, 1]
+
+    def test_record_scope_weighted_selection_distribution(self):
+        fake = self._make_fake(locale=OrderedDict([("en_US", 4), ("fr_FR", 1)]))
+        fake.seed_instance(1234)
+
+        counts = {"alpha-token": 0, "beta-token": 0}
+        for _ in range(2000):
+            with fake.record(providers=["record_token"]):
+                counts[fake.record_token()] += 1
+
+        assert 0.7 * 2000 < counts["alpha-token"] < 0.9 * 2000
+        assert 0.1 * 2000 < counts["beta-token"] < 0.3 * 2000
+
+    def test_record_scope_unsupported_method_fails_explicitly(self):
+        fake = self._make_fake()
+
+        with fake.record(providers=["alpha_only"]):
+            assert fake.record_token() == "alpha-token"
+            with pytest.raises(AttributeError, match="beta_only"):
+                fake.beta_only()
+
+        # Outside the scope, per-method selection still finds `beta_only`
+        assert fake.beta_only() == "beta-only"
+
+    def test_record_scope_explicit_locale(self):
+        fake = self._make_fake()
+
+        with fake.record(locale="fr-FR"):
+            assert fake.record_token() == "beta-token"
+            assert fake.beta_only() == "beta-only"
+            with pytest.raises(AttributeError, match="alpha_only"):
+                fake.alpha_only()
+
+    def test_record_scope_explicit_locale_unknown_or_unsuitable(self):
+        fake = self._make_fake()
+
+        with pytest.raises(NoSuitableLocaleError, match="de_DE"):
+            with fake.record(locale="de_DE"):
+                pass
+
+        with pytest.raises(NoSuitableLocaleError, match="alpha_only"):
+            with fake.record(locale="fr_FR", providers=["alpha_only"]):
+                pass
+
+    def test_record_scope_nesting_restores_outer_scope(self):
+        fake = self._make_fake()
+
+        with fake.record(providers=["alpha_only"]):
+            assert fake.record_token() == "alpha-token"
+            with fake.record(locale="fr_FR"):
+                assert fake.record_token() == "beta-token"
+            assert fake.record_token() == "alpha-token"
+
+    def test_record_scope_nesting_restores_on_exception(self):
+        fake = self._make_fake()
+
+        with fake.record(providers=["alpha_only"]):
+            with pytest.raises(RuntimeError):
+                with fake.record(locale="fr_FR"):
+                    assert fake.record_token() == "beta-token"
+                    raise RuntimeError("boom")
+            assert fake.record_token() == "alpha-token"
+
+        assert fake._record_scope_stack == []
+
+    def test_record_scope_exit_on_exception_restores_per_method_selection(self):
+        fake = self._make_fake()
+
+        with pytest.raises(RuntimeError):
+            with fake.record(providers=["alpha_only"]):
+                raise RuntimeError("boom")
+
+        assert fake._record_scope_stack == []
+        assert fake.alpha_only() == "alpha-only"
+        assert fake.beta_only() == "beta-only"
+
+    def test_record_scope_unique_proxy_uses_scoped_locale(self):
+        fake = self._make_fake()
+
+        with fake.record(providers=["alpha_only"]):
+            assert fake.unique.record_token() == "alpha-token"
+
+    def test_record_scope_deepcopy_starts_with_empty_stack(self):
+        fake = self._make_fake()
+
+        with fake.record(providers=["alpha_only"]):
+            clone = copy.deepcopy(fake)
+
+        assert clone._record_scope_stack == []

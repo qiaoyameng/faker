@@ -14,3 +14,7 @@ class UnsupportedFeature(BaseFakerException):
     def __init__(self, msg: str, name: str) -> None:
         self.name = name
         super().__init__(msg)
+
+
+class NoSuitableLocaleError(BaseFakerException):
+    """No locale can satisfy the providers required by a record scope."""
