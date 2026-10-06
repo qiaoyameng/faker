@@ -76,6 +76,16 @@ class Documentor:
             if name == "enum":
                 faker_args = [FakerEnum]
 
+            if name == "correlated_sample":
+                from .providers.python import lognormal_quantile, normal_quantile
+
+                faker_kwargs.update(
+                    {
+                        "correlation_matrix": [[1.0, 0.8], [0.8, 1.0]],
+                        "quantile_functions": [normal_quantile(100.0, 15.0), lognormal_quantile(2.0, 0.5)],
+                    }
+                )
+
             if with_args:
                 # retrieve all parameter
                 argspec = inspect.getfullargspec(method)

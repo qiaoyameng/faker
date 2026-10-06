@@ -1,3 +1,4 @@
+import bisect
 import math
 import string
 import sys
@@ -5,7 +6,24 @@ import warnings
 
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Type, TypeVar, Union, cast, no_type_check
+from statistics import NormalDist
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+    no_type_check,
+)
 
 from faker.typing import BasicNumber
 
@@ -19,6 +37,80 @@ TEnum = TypeVar("TEnum", bound=Enum)
 
 class EmptyEnumException(BaseFakerException):
     pass
+
+
+def normal_quantile(loc: float = 0.0, scale: float = 1.0) -> Callable[[float], float]:
+    """
+    Returns the quantile (inverse CDF) function of a normal distribution.
+
+    Suitable as a marginal for :meth:`Provider.correlated_sample`.
+
+    :param loc: mean of the distribution.
+    :param scale: standard deviation of the distribution, must be positive.
+    """
+    if scale <= 0:
+        raise ValueError("`scale` must be positive")
+    dist = NormalDist(mu=loc, sigma=scale)
+    return dist.inv_cdf
+
+
+def lognormal_quantile(mu: float = 0.0, sigma: float = 1.0) -> Callable[[float], float]:
+    """
+    Returns the quantile (inverse CDF) function of a lognormal distribution
+    whose underlying normal has mean `mu` and standard deviation `sigma`.
+
+    Suitable as a marginal for :meth:`Provider.correlated_sample`.
+
+    :param mu: mean of the underlying normal distribution.
+    :param sigma: standard deviation of the underlying normal distribution, must be positive.
+    """
+    if sigma <= 0:
+        raise ValueError("`sigma` must be positive")
+    dist = NormalDist(mu=mu, sigma=sigma)
+
+    def quantile(u: float) -> float:
+        return math.exp(dist.inv_cdf(u))
+
+    return quantile
+
+
+def discrete_quantile(values: Sequence[Any], probabilities: Optional[Sequence[float]] = None) -> Callable[[float], Any]:
+    """
+    Returns the quantile (inverse CDF) function of a distribution over a
+    finite set of discrete `values`.
+
+    Suitable as a marginal for :meth:`Provider.correlated_sample`. Note that
+    discretization attenuates correlation: the (Pearson or rank) correlation
+    of the generated discrete values is generally weaker than the correlation
+    coefficients handed to the Gaussian copula.
+
+    :param values: the support of the distribution, must be non-empty.
+    :param probabilities: optional probability (weight) per value, uniform if omitted.
+    """
+    if not values:
+        raise ValueError("`values` must be a non-empty sequence")
+    if probabilities is None:
+        probabilities = [1.0] * len(values)
+    if len(probabilities) != len(values):
+        raise ValueError("`probabilities` must have the same length as `values`")
+    if any(p < 0 for p in probabilities):
+        raise ValueError("`probabilities` must be non-negative")
+    total = float(sum(probabilities))
+    if total <= 0:
+        raise ValueError("`probabilities` must have a positive sum")
+    cumulative: List[float] = []
+    running = 0.0
+    for p in probabilities:
+        running += p / total
+        cumulative.append(running)
+    cumulative[-1] = 1.0
+    support = list(values)
+
+    def quantile(u: float) -> Any:
+        index = bisect.bisect_left(cumulative, u)
+        return support[min(index, len(support) - 1)]
+
+    return quantile
 
 
 class Provider(BaseProvider):
@@ -589,3 +681,142 @@ class Provider(BaseProvider):
             raise EmptyEnumException(f"The provided Enum: '{enum_cls.__name__}' has no members.")
 
         return self.random_element(members)
+
+    max_correlated_dimensions: int = 16
+
+    def correlated_sample(
+        self,
+        correlation_matrix: Sequence[Sequence[float]],
+        quantile_functions: Sequence[Callable[[float], Any]],
+    ) -> Tuple[Any, ...]:
+        """
+        Generates one vector of correlated values using a Gaussian copula.
+
+        Semantics: a vector ``Z ~ N(0, R)`` is drawn from the zero-mean
+        multivariate normal distribution whose covariance matrix is the given
+        correlation matrix ``R``. Each component is mapped to a uniform
+        variate ``U_i = Phi(Z_i)`` via the standard normal CDF, and the final
+        values are ``X_i = Q_i(U_i)`` where ``Q_i`` is the quantile (inverse
+        CDF) function of the i-th marginal. Ready-made marginals are available
+        as :func:`normal_quantile`, :func:`lognormal_quantile` and
+        :func:`discrete_quantile`, but any callable mapping ``(0, 1)`` to a
+        value may be used.
+
+        The correlation matrix must be symmetric, have ones on the diagonal
+        and be positive semidefinite. Singular (yet valid) matrices, e.g. for
+        perfectly correlated columns, are supported. Invalid matrices are
+        rejected with a ``ValueError`` instead of being silently repaired.
+
+        Note that the correlation of the generated values equals the input
+        coefficients only in special cases (e.g. normal marginals). Non-linear
+        or discrete marginals attenuate correlations, so after discretization
+        the output correlation is generally not equal to the input
+        coefficient. This is inherent to the copula transform, not a bug.
+
+        All randomness is drawn from this Faker instance's random generator,
+        so seeding the instance makes samples reproducible.
+
+        :param correlation_matrix: symmetric, positive semidefinite matrix
+            with unit diagonal; at most ``max_correlated_dimensions`` (16)
+            columns.
+        :param quantile_functions: one quantile (inverse CDF) function per
+            column of the correlation matrix.
+        :returns: a tuple with one generated value per column.
+        :raises ValueError: if the matrix is malformed or not a valid
+            correlation matrix, or the number of marginals does not match.
+        """
+        matrix, eigenvalues, eigenvectors = self._validate_correlation_matrix(correlation_matrix)
+        dimension = len(matrix)
+        if len(quantile_functions) != dimension:
+            raise ValueError(
+                f"`quantile_functions` must provide one quantile function per column "
+                f"({dimension} expected, got {len(quantile_functions)})"
+            )
+        for quantile_function in quantile_functions:
+            if not callable(quantile_function):
+                raise ValueError("every entry of `quantile_functions` must be callable")
+
+        random = self.generator.random
+        standard_normals = [random.gauss(0.0, 1.0) for _ in range(dimension)]
+        sqrt_two = math.sqrt(2.0)
+        sample = []
+        for i in range(dimension):
+            z_i = 0.0
+            row = eigenvectors[i]
+            for k in range(dimension):
+                if eigenvalues[k] > 0.0:
+                    z_i += row[k] * math.sqrt(eigenvalues[k]) * standard_normals[k]
+            u_i = 0.5 * (1.0 + math.erf(z_i / sqrt_two))
+            sample.append(quantile_functions[i](u_i))
+        return tuple(sample)
+
+    def _validate_correlation_matrix(
+        self, correlation_matrix: Sequence[Sequence[float]]
+    ) -> Tuple[List[List[float]], List[float], List[List[float]]]:
+        tolerance = 1e-9
+        try:
+            matrix = [[float(entry) for entry in row] for row in correlation_matrix]
+        except (TypeError, ValueError):
+            raise ValueError("`correlation_matrix` must be a square matrix of real numbers") from None
+        dimension = len(matrix)
+        if dimension == 0:
+            raise ValueError("`correlation_matrix` must not be empty")
+        if dimension > self.max_correlated_dimensions:
+            raise ValueError(
+                f"`correlation_matrix` dimension {dimension} exceeds the limit of {self.max_correlated_dimensions}"
+            )
+        if any(len(row) != dimension for row in matrix):
+            raise ValueError("`correlation_matrix` must be square")
+        for i in range(dimension):
+            if abs(matrix[i][i] - 1.0) > tolerance:
+                raise ValueError("`correlation_matrix` must have ones on the diagonal")
+            for j in range(i + 1, dimension):
+                if abs(matrix[i][j] - matrix[j][i]) > tolerance:
+                    raise ValueError("`correlation_matrix` must be symmetric")
+        eigenvalues, eigenvectors = self._jacobi_eigen_decomposition(matrix)
+        if min(eigenvalues) < -tolerance:
+            raise ValueError("`correlation_matrix` must be positive semidefinite")
+        return matrix, eigenvalues, eigenvectors
+
+    @staticmethod
+    def _jacobi_eigen_decomposition(matrix: List[List[float]]) -> Tuple[List[float], List[List[float]]]:
+        """
+        Computes the eigen decomposition of a small symmetric matrix with the
+        cyclic Jacobi method (standard library only).
+
+        :returns: a tuple ``(eigenvalues, eigenvectors)`` where column ``k``
+            of ``eigenvectors`` is the eigenvector for ``eigenvalues[k]``.
+        """
+        dimension = len(matrix)
+        a = [row[:] for row in matrix]
+        vectors = [[1.0 if i == j else 0.0 for j in range(dimension)] for i in range(dimension)]
+        for _ in range(50):
+            off_diagonal_norm = math.sqrt(
+                sum(a[i][j] ** 2 for i in range(dimension) for j in range(dimension) if i != j)
+            )
+            if off_diagonal_norm <= 1e-12:
+                break
+            for p in range(dimension - 1):
+                for q in range(p + 1, dimension):
+                    apq = a[p][q]
+                    if apq == 0.0:
+                        continue
+                    theta = (a[q][q] - a[p][p]) / (2.0 * apq)
+                    sign = 1.0 if theta >= 0.0 else -1.0
+                    t = sign / (abs(theta) + math.sqrt(theta * theta + 1.0))
+                    c = 1.0 / math.sqrt(t * t + 1.0)
+                    s = t * c
+                    for k in range(dimension):
+                        akp, akq = a[k][p], a[k][q]
+                        a[k][p] = c * akp - s * akq
+                        a[k][q] = s * akp + c * akq
+                    for k in range(dimension):
+                        apk, aqk = a[p][k], a[q][k]
+                        a[p][k] = c * apk - s * aqk
+                        a[q][k] = s * apk + c * aqk
+                    for k in range(dimension):
+                        vkp, vkq = vectors[k][p], vectors[k][q]
+                        vectors[k][p] = c * vkp - s * vkq
+                        vectors[k][q] = s * vkp + c * vkq
+        eigenvalues = [a[i][i] for i in range(dimension)]
+        return eigenvalues, vectors

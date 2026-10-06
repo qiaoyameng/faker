@@ -2876,6 +2876,49 @@ class Faker:
         """
         ...
 
+    def correlated_sample(
+        self,
+        correlation_matrix: Sequence[Sequence[float]],
+        quantile_functions: Sequence[Callable[[float], Any]],
+    ) -> Tuple[Any, ...]:
+        """
+        Generates one vector of correlated values using a Gaussian copula.
+
+        Semantics: a vector ``Z ~ N(0, R)`` is drawn from the zero-mean
+        multivariate normal distribution whose covariance matrix is the given
+        correlation matrix ``R``. Each component is mapped to a uniform
+        variate ``U_i = Phi(Z_i)`` via the standard normal CDF, and the final
+        values are ``X_i = Q_i(U_i)`` where ``Q_i`` is the quantile (inverse
+        CDF) function of the i-th marginal. Ready-made marginals are available
+        as :func:`normal_quantile`, :func:`lognormal_quantile` and
+        :func:`discrete_quantile`, but any callable mapping ``(0, 1)`` to a
+        value may be used.
+
+        The correlation matrix must be symmetric, have ones on the diagonal
+        and be positive semidefinite. Singular (yet valid) matrices, e.g. for
+        perfectly correlated columns, are supported. Invalid matrices are
+        rejected with a ``ValueError`` instead of being silently repaired.
+
+        Note that the correlation of the generated values equals the input
+        coefficients only in special cases (e.g. normal marginals). Non-linear
+        or discrete marginals attenuate correlations, so after discretization
+        the output correlation is generally not equal to the input
+        coefficient. This is inherent to the copula transform, not a bug.
+
+        All randomness is drawn from this Faker instance's random generator,
+        so seeding the instance makes samples reproducible.
+
+        :param correlation_matrix: symmetric, positive semidefinite matrix
+            with unit diagonal; at most ``max_correlated_dimensions`` (16)
+            columns.
+        :param quantile_functions: one quantile (inverse CDF) function per
+            column of the correlation matrix.
+        :returns: a tuple with one generated value per column.
+        :raises ValueError: if the matrix is malformed or not a valid
+            correlation matrix, or the number of marginals does not match.
+        """
+        ...
+
     def pybool(self, truth_probability: int = ...) -> bool:
         """
         Generates a random boolean, optionally biased towards `True` or `False`.

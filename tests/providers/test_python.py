@@ -1,4 +1,6 @@
 import decimal
+import math
+import statistics
 import sys
 import unittest
 import warnings
@@ -10,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from faker import Faker
+from faker.providers.python import discrete_quantile, lognormal_quantile, normal_quantile
 
 
 @pytest.mark.parametrize("object_type", (None, bool, str, float, int, tuple, set, list, Iterable, dict))
@@ -757,3 +760,160 @@ class TestPython(unittest.TestCase):
         assert some_list
         for item in some_list:
             assert isinstance(item, (int, float))
+
+
+def _pearson(x, y):
+    mean_x, mean_y = statistics.mean(x), statistics.mean(y)
+    covariance = sum((a - mean_x) * (b - mean_y) for a, b in zip(x, y))
+    return covariance / math.sqrt(
+        sum((a - mean_x) ** 2 for a in x) * sum((b - mean_y) ** 2 for b in y)
+    )
+
+
+def _ranks(values):
+    order = sorted(range(len(values)), key=values.__getitem__)
+    ranks = [0.0] * len(values)
+    for rank, index in enumerate(order):
+        ranks[index] = float(rank)
+    return ranks
+
+
+class TestCorrelatedSample(unittest.TestCase):
+    """Tests the Gaussian copula based `correlated_sample` generator."""
+
+    def setUp(self):
+        self.factory = Faker()
+        Faker.seed(20261006)
+
+    def test_perfectly_correlated_columns_are_deterministically_linked(self):
+        matrix = [[1.0, 1.0], [1.0, 1.0]]
+        marginals = [normal_quantile(100.0, 15.0), normal_quantile(100.0, 15.0)]
+        for _ in range(100):
+            first, second = self.factory.correlated_sample(matrix, marginals)
+            assert first == second
+
+    def test_perfectly_correlated_columns_have_identical_ranks_across_marginals(self):
+        matrix = [[1.0, 1.0], [1.0, 1.0]]
+        marginals = [normal_quantile(), lognormal_quantile(0.0, 0.5)]
+        samples = [self.factory.correlated_sample(matrix, marginals) for _ in range(500)]
+        first, second = zip(*samples)
+        assert _pearson(_ranks(first), _ranks(second)) == pytest.approx(1.0)
+
+    def test_perfectly_independent_columns_are_uncorrelated(self):
+        matrix = [[1.0, 0.0], [0.0, 1.0]]
+        marginals = [normal_quantile(), normal_quantile()]
+        samples = [self.factory.correlated_sample(matrix, marginals) for _ in range(4000)]
+        first, second = zip(*samples)
+        assert abs(_pearson(first, second)) < 0.05
+
+    def test_singular_matrix_with_three_columns(self):
+        matrix = [[1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        marginals = [normal_quantile(), lognormal_quantile(), discrete_quantile([1, 2, 3])]
+        for _ in range(100):
+            first, second, third = self.factory.correlated_sample(matrix, marginals)
+            assert second == math.exp(first)
+            assert third in (1, 2, 3)
+
+    def test_invalid_correlation_matrix_is_rejected(self):
+        invalid_matrices = {
+            "empty": [],
+            "not-square": [[1.0, 0.5]],
+            "ragged": [[1.0, 0.5, 0.0], [0.5, 1.0, 0.0]],
+            "asymmetric": [[1.0, 0.5], [0.4, 1.0]],
+            "diagonal-not-one": [[1.0, 0.0], [0.0, 0.9]],
+            "correlation-greater-than-one": [[1.0, 1.5], [1.5, 1.0]],
+            "not-positive-semidefinite": [[1.0, -0.9, 0.0], [-0.9, 1.0, -0.9], [0.0, -0.9, 1.0]],
+            "non-numeric": [["a", 0.0], [0.0, 1.0]],
+        }
+        for case, matrix in invalid_matrices.items():
+            with self.subTest(case=case):
+                marginals = [normal_quantile()] * max(len(matrix), 1)
+                with pytest.raises(ValueError, match="correlation_matrix"):
+                    self.factory.correlated_sample(matrix, marginals)
+
+    def test_dimension_limit_is_enforced(self):
+        from faker.providers.python import Provider as PythonProvider
+
+        dimension = PythonProvider.max_correlated_dimensions + 1
+        matrix = [[float(i == j) for j in range(dimension)] for i in range(dimension)]
+        with pytest.raises(ValueError, match="exceeds the limit"):
+            self.factory.correlated_sample(matrix, [normal_quantile()] * dimension)
+
+    def test_quantile_function_count_must_match_matrix(self):
+        matrix = [[1.0, 0.5], [0.5, 1.0]]
+        with pytest.raises(ValueError, match="one quantile function per column"):
+            self.factory.correlated_sample(matrix, [normal_quantile()])
+        with pytest.raises(ValueError, match="must be callable"):
+            self.factory.correlated_sample(matrix, [normal_quantile(), 42])
+
+    def test_fixed_seed_marginals_and_rank_correlation(self):
+        matrix = [[1.0, 0.8, 0.0], [0.8, 1.0, 0.6], [0.0, 0.6, 1.0]]
+        marginals = [
+            normal_quantile(100.0, 15.0),
+            lognormal_quantile(3.0, 0.4),
+            discrete_quantile(["fast", "ok", "slow"], [0.5, 0.3, 0.2]),
+        ]
+        samples = [self.factory.correlated_sample(matrix, marginals) for _ in range(4000)]
+        amounts, durations, buckets = zip(*samples)
+
+        assert statistics.mean(amounts) == pytest.approx(100.0, abs=1.0)
+        assert statistics.stdev(amounts) == pytest.approx(15.0, rel=0.05)
+        assert all(duration > 0 for duration in durations)
+        assert statistics.median(durations) == pytest.approx(math.exp(3.0), rel=0.05)
+        assert set(buckets) == {"fast", "ok", "slow"}
+
+        rank_correlation = _pearson(_ranks(amounts), _ranks(durations))
+        assert rank_correlation == pytest.approx(0.8, abs=0.05)
+        # Discretization attenuates correlation: still clearly positive, but
+        # weaker than the 0.6 input coefficient.
+        discrete_rank_correlation = _pearson(_ranks(durations), _ranks(buckets))
+        assert 0.3 < discrete_rank_correlation < 0.6
+
+    def test_randomness_comes_from_the_faker_instance(self):
+        matrix = [[1.0, 0.7], [0.7, 1.0]]
+        marginals = [normal_quantile(), lognormal_quantile()]
+        first = Faker()
+        second = Faker()
+        first.seed_instance(31337)
+        second.seed_instance(31337)
+        assert [first.correlated_sample(matrix, marginals) for _ in range(10)] == [
+            second.correlated_sample(matrix, marginals) for _ in range(10)
+        ]
+
+
+class TestMarginalQuantiles(unittest.TestCase):
+    def test_normal_quantile(self):
+        quantile = normal_quantile(10.0, 2.0)
+        assert quantile(0.5) == pytest.approx(10.0)
+        assert quantile(0.975) == pytest.approx(10.0 + 2.0 * 1.959964, rel=1e-5)
+        with pytest.raises(ValueError, match="`scale` must be positive"):
+            normal_quantile(0.0, 0.0)
+
+    def test_lognormal_quantile(self):
+        quantile = lognormal_quantile(1.0, 0.5)
+        assert quantile(0.5) == pytest.approx(math.e)
+        assert quantile(0.1) < quantile(0.5) < quantile(0.9)
+        with pytest.raises(ValueError, match="`sigma` must be positive"):
+            lognormal_quantile(0.0, -1.0)
+
+    def test_discrete_quantile(self):
+        quantile = discrete_quantile(["a", "b", "c"], [0.2, 0.3, 0.5])
+        assert quantile(0.1) == "a"
+        assert quantile(0.2) == "a"
+        assert quantile(0.5) == "b"
+        assert quantile(0.9) == "c"
+        uniform = discrete_quantile([10, 20])
+        assert uniform(0.25) == 10
+        assert uniform(0.75) == 20
+
+    def test_discrete_quantile_rejects_bad_input(self):
+        bad_inputs = {
+            "empty-values": ([], None),
+            "length-mismatch": (["a"], [0.5, 0.5]),
+            "negative-probability": (["a", "b"], [0.5, -0.1]),
+            "zero-sum": (["a", "b"], [0.0, 0.0]),
+        }
+        for case, (values, probabilities) in bad_inputs.items():
+            with self.subTest(case=case):
+                with pytest.raises(ValueError):
+                    discrete_quantile(values, probabilities)
